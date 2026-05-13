@@ -6,6 +6,7 @@ Chaque onglet a une ligne par commune + une ligne TOTAL/MOYENNE pondérée.
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
+from scrapers.insee import compute_zone_totals
 
 
 # ── Styles ────────────────────────────────────────────────────────────────────
@@ -260,40 +261,64 @@ def _onglet_synthese(wb, communes_data: list[dict], pj_data: list[dict],
                      sages_femmes: list[dict], pmi: list[dict],
                      zone_nom: str, dept_code: str, dept_nom: str, region: str) -> None:
     ws = wb.create_sheet("Synthese_Zone")
+
+    # Calcul des totaux/moyennes pondérées via insee.py
+    t = compute_zone_totals(communes_data)
+
+    def _v(key):
+        """Retourne la valeur agrégée ou 'N/D'."""
+        val = t.get(key)
+        return val if val is not None else "N/D"
+
     rows = [
-        ["VARIABLE", "VALEUR", "SOURCE / MILLÉSIME"],
-        ["Zone", zone_nom, "Saisie"],
-        ["Département", f"{dept_nom} ({dept_code})", "Saisie"],
-        ["Région", region, "Saisie"],
-        ["Nb communes", len(communes_data), "Calculé"],
-        ["Population totale 2022", _sum_col(communes_data, "pop_2022"), "INSEE RP 2022"],
-        ["Superficie totale (km²)", _sum_col(communes_data, "superficie_km2"), "INSEE RP 2022"],
-        ["Densité moy. pondérée (hab/km²)", _weighted_avg(communes_data, "densite_2022"), "INSEE RP 2022"],
-        ["Variation pop. moy. 2016-2022 (%)", _weighted_avg(communes_data, "var_pop_2016_2022"), "INSEE RP 2022"],
-        ["Nb ménages 2022", _sum_col(communes_data, "nb_menages_2022"), "INSEE RP 2022"],
-        ["Naissances domiciliées 2022", _sum_col(communes_data, "naissances_2022"), "INSEE État civil 2022"],
-        ["Décès domiciliés 2022", _sum_col(communes_data, "deces_2022"), "INSEE État civil 2022"],
-        ["Nb logements 2022", _sum_col(communes_data, "nb_logements_2022"), "INSEE RP 2022"],
-        ["Part résidences principales (%)", _weighted_avg(communes_data, "part_res_principales_2022"), "INSEE RP 2022"],
-        ["Part résidences secondaires (%)", _weighted_avg(communes_data, "part_res_secondaires_2022"), "INSEE RP 2022"],
-        ["Part logements vacants (%)", _weighted_avg(communes_data, "part_logements_vacants_2022"), "INSEE RP 2022"],
-        ["Part ménages propriétaires (%)", _weighted_avg(communes_data, "part_proprietaires_2022"), "INSEE RP 2022"],
-        ["Nb ménages fiscaux 2021", _sum_col(communes_data, "nb_menages_fiscaux_2021"), "INSEE DGI 2021"],
-        ["Part ménages imposés 2021 (%)", _weighted_avg(communes_data, "part_menages_imposes_2021"), "INSEE DGI 2021"],
-        ["Médiane revenu disponible 2021 (€)", _weighted_avg(communes_data, "mediane_revenu_2021"), "INSEE Filosofi 2021"],
-        ["Taux de pauvreté 2021 (%)", _weighted_avg(communes_data, "taux_pauvrete_2021"), "INSEE Filosofi 2021"],
-        ["Emploi total 2022", _sum_col(communes_data, "emploi_total_2022"), "INSEE RP 2022"],
-        ["Part emploi salarié 2022 (%)", _weighted_avg(communes_data, "part_emploi_salarie_2022"), "INSEE RP 2022"],
-        ["Variation emploi 2016-2022 (%)", _weighted_avg(communes_data, "var_emploi_2016_2022"), "INSEE RP 2022"],
-        ["Taux d'activité 15-64 ans 2022 (%)", _weighted_avg(communes_data, "taux_activite_15_64_2022"), "INSEE RP 2022"],
-        ["Taux de chômage 15-64 ans 2022 (%)", _weighted_avg(communes_data, "taux_chomage_15_64_2022"), "INSEE RP 2022"],
-        ["Nb établissements actifs 2023", _sum_col(communes_data, "nb_etab_actifs_2023"), "INSEE REE 2023"],
-        ["Nb pharmacies (total zone)", sum(r.get("nb_pharmacies", 0) for r in pj_data), "Pages Jaunes"],
-        ["Nb magasins matériel médical (total zone)", sum(r.get("nb_materiel_medical", 0) for r in pj_data), "Pages Jaunes"],
-        ["Nb maternités", len([m for m in maternites if m.get("nom") and "Erreur" not in m["nom"]]), "Journal des Femmes"],
-        ["Nb lactariums sur zone", len([l for l in lactariums if "aucun" not in l.get("nom", "").lower()]), "ALF"],
-        ["Nb sages-femmes libérales (dédoublonné)", len(sages_femmes), "Ordre SF"],
-        ["Nb PMI", len([p for p in pmi if p.get("nom") and "Erreur" not in p["nom"]]), "AlloPMI"],
+        ["VARIABLE", "VALEUR ZONE", "TYPE DE CALCUL", "SOURCE / MILLÉSIME"],
+        ["Zone", zone_nom, "", "Saisie"],
+        ["Département", f"{dept_nom} ({dept_code})", "", "Saisie"],
+        ["Région", region, "", "Saisie"],
+        ["Nb communes", len(communes_data), "Comptage", "Calculé"],
+        # ── Population ──────────────────────────────────────────────────────
+        ["Population totale 2022",              _v("pop_2022"),             "Somme",               "INSEE RP 2022"],
+        ["Superficie totale (km²)",             _v("superficie_km2"),       "Somme",               "INSEE RP 2022"],
+        ["Densité (hab/km²)",                   _v("densite_2022"),         "Pop totale / Superf.", "INSEE RP 2022"],
+        ["Variation pop. 2016-2022 (%)",        _v("var_pop_2016_2022"),    "Moy. pond. / pop.",   "INSEE RP 2022"],
+        ["Dont solde naturel (%)",              _v("solde_naturel"),        "Moy. pond. / pop.",   "INSEE RP 2022"],
+        ["Dont solde migratoire (%)",           _v("solde_migratoire"),     "Moy. pond. / pop.",   "INSEE RP 2022"],
+        ["Nb ménages 2022",                     _v("nb_menages_2022"),      "Somme",               "INSEE RP 2022"],
+        ["Naissances domiciliées",              _v("naissances_2022"),      "Somme",               "INSEE État civil"],
+        ["Décès domiciliés",                    _v("deces_2022"),           "Somme",               "INSEE État civil"],
+        # ── Logement ────────────────────────────────────────────────────────
+        ["Nb logements 2022",                   _v("nb_logements_2022"),    "Somme",               "INSEE RP 2022"],
+        ["Part résidences principales (%)",     _v("part_res_principales_2022"),  "Moy. pond. / pop.", "INSEE RP 2022"],
+        ["Part résidences secondaires (%)",     _v("part_res_secondaires_2022"),  "Moy. pond. / pop.", "INSEE RP 2022"],
+        ["Part logements vacants (%)",          _v("part_logements_vacants_2022"),"Moy. pond. / pop.", "INSEE RP 2022"],
+        ["Part ménages propriétaires (%)",      _v("part_proprietaires_2022"),    "Moy. pond. / pop.", "INSEE RP 2022"],
+        # ── Revenus ─────────────────────────────────────────────────────────
+        ["Nb ménages fiscaux",                  _v("nb_menages_fiscaux_2021"),    "Somme",             "INSEE DGI 2021"],
+        ["Part ménages imposés (%)",            _v("part_menages_imposes_2021"),  "Moy. pond. / pop.", "INSEE DGI 2021"],
+        ["Médiane revenu disponible (€)",       _v("mediane_revenu_2021"),        "Moy. pond. / pop.", "INSEE Filosofi"],
+        ["Taux de pauvreté (%)",                _v("taux_pauvrete_2021"),         "Moy. pond. / pop.", "INSEE Filosofi"],
+        # ── Emploi ──────────────────────────────────────────────────────────
+        ["Emploi total 2022",                   _v("emploi_total_2022"),          "Somme",             "INSEE RP 2022"],
+        ["Part emploi salarié (%)",             _v("part_emploi_salarie_2022"),   "Moy. pond. / pop.", "INSEE RP 2022"],
+        ["Variation emploi 2016-2022 (%)",      _v("var_emploi_2016_2022"),       "Moy. pond. / pop.", "INSEE RP 2022"],
+        ["Taux d'activité 15-64 ans (%)",       _v("taux_activite_15_64_2022"),   "Moy. pond. / pop.", "INSEE RP 2022"],
+        ["Taux de chômage 15-64 ans (%)",       _v("taux_chomage_15_64_2022"),    "Moy. pond. / pop.", "INSEE RP 2022"],
+        # ── Établissements ──────────────────────────────────────────────────
+        ["Nb établissements actifs",            _v("nb_etab_actifs_2023"),        "Somme",             "INSEE REE 2024"],
+        ["Part agriculture (%)",                _v("part_agriculture_2023"),      "Moy. pond. / pop.", "INSEE REE 2024"],
+        ["Part industrie (%)",                  _v("part_industrie_2023"),        "Moy. pond. / pop.", "INSEE REE 2024"],
+        ["Part construction (%)",               _v("part_construction_2023"),     "Moy. pond. / pop.", "INSEE REE 2024"],
+        ["Part commerce / transports (%)",      _v("part_commerce_transp_2023"),  "Moy. pond. / pop.", "INSEE REE 2024"],
+        ["Part admin. / santé (%)",             _v("part_admin_sante_2023"),      "Moy. pond. / pop.", "INSEE REE 2024"],
+        ["Part étab. 1-9 salariés (%)",         _v("part_etab_1_9_sal_2023"),     "Moy. pond. / pop.", "INSEE REE 2024"],
+        ["Part étab. 10+ salariés (%)",         _v("part_etab_10_sal_plus_2023"), "Moy. pond. / pop.", "INSEE REE 2024"],
+        # ── Autres sources ──────────────────────────────────────────────────
+        ["Nb pharmacies",                       sum(r.get("nb_pharmacies", 0) for r in pj_data),       "Somme", "Pages Jaunes"],
+        ["Nb magasins matériel médical",        sum(r.get("nb_materiel_medical", 0) for r in pj_data), "Somme", "Pages Jaunes"],
+        ["Nb maternités",                       len([m for m in maternites if m.get("nom") and "Erreur" not in m["nom"]]), "Comptage", "Journal des Femmes"],
+        ["Nb lactariums",                       len([l for l in lactariums if "aucun" not in l.get("nom", "").lower()]),   "Comptage", "ALF"],
+        ["Nb sages-femmes libérales",           len(sages_femmes),                                     "Comptage (dédoublonné)", "Ordre SF"],
+        ["Nb PMI",                              len([p for p in pmi if p.get("nom") and "Erreur" not in p["nom"]]),        "Comptage", "AlloPMI"],
     ]
 
     for row_idx, row in enumerate(rows, 1):

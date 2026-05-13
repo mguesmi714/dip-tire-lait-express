@@ -58,6 +58,7 @@ st.markdown("""
 def _init():
     defaults = {
         "step": 1,
+        "collect_step": 1,   # sous-étape de collecte (1=maternités … 6=PMI)
         "cp_uniques": [],
         "communes_par_cp": {},
         "dept_code": "",
@@ -227,7 +228,6 @@ elif st.session_state.step == 2:
 # ══════════════════════════════════════════════════════════════════════════════
 
 elif st.session_state.step == 3:
-    st.subheader("⚙️ Étape 3 — Collecte en cours")
 
     communes_par_cp = st.session_state.communes_par_cp
     cp_uniques      = st.session_state.cp_uniques
@@ -235,7 +235,7 @@ elif st.session_state.step == 3:
     dept_nom        = st.session_state.dept_nom
     region          = st.session_state.region
 
-    # Aplatir les communes
+    # Aplatir les communes (calcul une seule fois)
     communes_flat: list[dict] = []
     seen_cog: set[str] = set()
     for cp, communes in communes_par_cp.items():
@@ -250,101 +250,228 @@ elif st.session_state.step == 3:
 
     communes_pj = [{"nom": c["nom"], "cp": c.get("cp", "")} for c in communes_flat]
 
-    # Construire le dict cp → communes pour le scraper maternités
     cp_communes_dict = {
-        cp: [
-            dict(c, code_insee=c.get("code_insee") or c.get("code", ""))
-            for c in communes
-        ]
+        cp: [dict(c, code_insee=c.get("code_insee") or c.get("code", "")) for c in communes]
         for cp, communes in communes_par_cp.items()
     }
 
-    progress_bar = st.progress(0)
-    status_lines = st.empty()
-    log: list[str] = []
-    results: dict  = {}
-    total = 6
-
-    def run_scraper(key, fn, *args):
-        try:
-            return key, fn(*args), None
-        except Exception as e:
-            return key, ([] if key != "maternites" else {}), str(e)
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as exe:
-        futures = {
-            exe.submit(run_scraper, "insee",        get_all_communes_data,      communes_flat):          "insee",
-            exe.submit(run_scraper, "pages_jaunes", get_pharmacies_and_medical, communes_pj):            "pages_jaunes",
-            exe.submit(run_scraper, "maternites",   get_maternites_par_cp,      cp_communes_dict):       "maternites",
-            exe.submit(run_scraper, "lactariums",   get_lactariums,             dept_code, region):      "lactariums",
-            exe.submit(run_scraper, "sages_femmes", get_sages_femmes,           communes_pj):            "sages_femmes",
-            exe.submit(run_scraper, "pmi",          get_pmi,                    dept_code, dept_nom):    "pmi",
-        }
-        labels = {
-            "insee":        "INSEE — données socio-démographiques",
-            "pages_jaunes": "Pages Jaunes — pharmacies & matériel médical",
-            "maternites":   "Journal des Femmes — maternités",
-            "lactariums":   "ALF — lactariums",
-            "sages_femmes": "Ordre SF — sages-femmes libérales",
-            "pmi":          "AlloPMI — PMI",
-        }
-        done = 0
-        for f in concurrent.futures.as_completed(futures):
-            key, data, err = f.result()
-            results[key] = data
-            done += 1
-            icon = "✅" if not err else "❌"
-            log.append(f"{icon} {labels[key]}" + (f"  _{err}_" if err else ""))
-            status_lines.markdown("\n\n".join(log))
-            progress_bar.progress(done / total)
-
-    st.session_state.results = results
-
-    # Générer les fichiers
-    mat_raw = results.get("maternites", {})
-    maternites_flat = [
-        dict(m, _cp_recherche=cp)
-        for cp, mats in (mat_raw.items() if isinstance(mat_raw, dict) else {}.items())
-        for m in mats
+    # ── Définition des 6 sous-étapes ──────────────────────────────────────────
+    COLLECT_STEPS = [
+        {
+            "key":   "maternites",
+            "label": "🏥 Maternités",
+            "desc":  "Journal des Femmes — maternités par code postal",
+            "fn":    get_maternites_par_cp,
+            "args":  (cp_communes_dict,),
+        },
+        {
+            "key":   "insee",
+            "label": "📊 INSEE",
+            "desc":  "INSEE — données socio-démographiques",
+            "fn":    get_all_communes_data,
+            "args":  (communes_flat,),
+        },
+        {
+            "key":   "pages_jaunes",
+            "label": "💊 Pharmacies",
+            "desc":  "Pages Jaunes — pharmacies & matériel médical",
+            "fn":    get_pharmacies_and_medical,
+            "args":  (communes_pj,),
+        },
+        {
+            "key":   "lactariums",
+            "label": "🥛 Lactariums",
+            "desc":  "ALF — lactariums",
+            "fn":    get_lactariums,
+            "args":  (dept_code, region),
+        },
+        {
+            "key":   "sages_femmes",
+            "label": "🤱 Sages-femmes",
+            "desc":  "Ordre SF — sages-femmes libérales",
+            "fn":    get_sages_femmes,
+            "args":  (communes_pj,),
+        },
+        {
+            "key":   "pmi",
+            "label": "👶 PMI",
+            "desc":  "AlloPMI — PMI",
+            "fn":    get_pmi,
+            "args":  (dept_code, dept_nom),
+        },
     ]
 
-    today     = date.today().strftime("%Y-%m-%d")
-    zone_slug = f"DIP_{dept_nom or dept_code}".replace(" ", "_")[:30]
-    out_dir   = Path(__file__).parent / "output"
-    out_dir.mkdir(exist_ok=True)
-    xlsx_path = str(out_dir / f"donnees_{zone_slug}_{today}.xlsx")
-    docx_path = str(out_dir / f"synthese_{zone_slug}_{today}.docx")
-    zone_nom  = f"{dept_nom} ({dept_code})" if dept_nom else dept_code
+    cs = st.session_state.collect_step  # 1..6
+    current = COLLECT_STEPS[cs - 1]
 
-    with st.spinner("Génération du fichier Excel…"):
-        generate_excel(
-            output_path=xlsx_path, zone_nom=zone_nom,
-            dept_code=dept_code, dept_nom=dept_nom, region=region,
-            communes_data=results.get("insee", []),
-            pj_data=results.get("pages_jaunes", []),
-            maternites=maternites_flat,
-            lactariums=results.get("lactariums", []),
-            sages_femmes=results.get("sages_femmes", []),
-            pmi=results.get("pmi", []),
-        )
-        st.session_state.xlsx_bytes = open(xlsx_path, "rb").read()
+    # Barre de progression des sous-étapes
+    st.subheader(f"⚙️ Étape 3 — Collecte  ({cs}/{len(COLLECT_STEPS)})")
+    mini_cols = st.columns(len(COLLECT_STEPS))
+    for i, s in enumerate(COLLECT_STEPS, 1):
+        with mini_cols[i - 1]:
+            if i < cs:
+                st.markdown(f"<span style='color:#2e7d32'>✓ {s['label']}</span>", unsafe_allow_html=True)
+            elif i == cs:
+                st.markdown(f"<span style='color:#1F4E79;font-weight:bold'>▶ {s['label']}</span>", unsafe_allow_html=True)
+            else:
+                st.markdown(f"<span style='color:#aaa'>{s['label']}</span>", unsafe_allow_html=True)
 
-    with st.spinner("Génération du document Word…"):
-        generate_word(
-            output_path=docx_path, zone_nom=zone_nom,
-            dept_code=dept_code, dept_nom=dept_nom, region=region,
-            communes=communes_flat,
-            communes_data=results.get("insee", []),
-            pj_data=results.get("pages_jaunes", []),
-            maternites=maternites_flat,
-            lactariums=results.get("lactariums", []),
-            sages_femmes=results.get("sages_femmes", []),
-            pmi=results.get("pmi", []),
-        )
-        st.session_state.docx_bytes = open(docx_path, "rb").read()
+    st.divider()
 
-    st.session_state.step = 4
-    st.rerun()
+    # ── Lancer la sous-étape courante ─────────────────────────────────────────
+    key = current["key"]
+
+    # Si pas encore de résultat pour cette clé, lancer le scraper
+    if key not in st.session_state.results:
+        with st.spinner(f"Collecte en cours : {current['desc']}…"):
+            try:
+                data = current["fn"](*current["args"])
+                st.session_state.results[key] = data
+                err = None
+            except Exception as e:
+                st.session_state.results[key] = {} if key == "maternites" else []
+                err = str(e)
+
+        if err:
+            st.error(f"Erreur : {err}")
+        else:
+            st.success(f"✅ {current['desc']} — collecte terminée")
+        st.rerun()
+
+    # ── Afficher les résultats de la sous-étape ───────────────────────────────
+    data = st.session_state.results.get(key)
+
+    st.markdown(f"### {current['label']} — Résultats")
+
+    if key == "maternites" and isinstance(data, dict):
+        rows = []
+        for cp, mats in data.items():
+            if mats:
+                for m in mats:
+                    rows.append({"CP": cp, "Maternité": m.get("nom",""), "Statut": m.get("statut",""),
+                                 "Niveau": m.get("type_niveau",""), "Accouchements/an": m.get("nb_accouchements_an",""), "Ville": m.get("ville","")})
+            else:
+                rows.append({"CP": cp, "Maternité": "—", "Statut": "", "Niveau": "", "Accouchements/an": "", "Ville": ""})
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    elif key == "insee" and isinstance(data, list):
+        if data:
+            df = pd.DataFrame([{
+                "Commune": r.get("commune",""), "Population 2022": r.get("pop_2022",""),
+                "Naissances": r.get("naissances_2022",""), "Taux chômage": r.get("taux_chomage_15_64_2022",""),
+                "Médiane revenu": r.get("mediane_revenu_2021",""), "Statut": r.get("_statut","OK"),
+            } for r in data])
+            st.dataframe(df, use_container_width=True, hide_index=True)
+        else:
+            st.warning("Aucune donnée INSEE récupérée.")
+
+    elif key == "pages_jaunes" and isinstance(data, list):
+        if data:
+            df = pd.DataFrame([{
+                "Commune": r.get("commune",""), "CP": r.get("cp",""),
+                "Pharmacies": r.get("nb_pharmacies",0), "Matériel médical": r.get("nb_materiel_medical",0),
+            } for r in data])
+            st.dataframe(df, use_container_width=True, hide_index=True)
+        else:
+            st.warning("Aucune donnée Pages Jaunes récupérée.")
+
+    elif key == "lactariums" and isinstance(data, list):
+        if data:
+            st.dataframe(pd.DataFrame([{"Nom": r.get("nom",""), "Département": r.get("departement",""), "Tél.": r.get("telephone","")} for r in data]),
+                         use_container_width=True, hide_index=True)
+        else:
+            st.info("Aucun lactarium sur cette zone.")
+
+    elif key == "sages_femmes" and isinstance(data, list):
+        if data:
+            st.dataframe(pd.DataFrame([{"Nom": f"{r.get('nom','')} {r.get('prenom','')}".strip(),
+                "Adresse": r.get("adresse",""), "Tél.": r.get("telephone",""), "Email": r.get("email","")} for r in data]),
+                         use_container_width=True, hide_index=True)
+        else:
+            st.warning("Aucune sage-femme trouvée.")
+
+    elif key == "pmi" and isinstance(data, list):
+        if data:
+            st.dataframe(pd.DataFrame([{"Nom": r.get("nom",""), "Adresse": r.get("adresse",""), "Tél.": r.get("telephone","")} for r in data]),
+                         use_container_width=True, hide_index=True)
+        else:
+            st.warning("Aucune PMI trouvée.")
+
+    st.divider()
+
+    # ── Boutons navigation ────────────────────────────────────────────────────
+    col_back, col_retry, col_next = st.columns([1, 1, 4])
+
+    with col_back:
+        if st.button("← Retour"):
+            if cs > 1:
+                # Effacer le résultat de l'étape courante pour pouvoir la relancer
+                st.session_state.results.pop(key, None)
+                st.session_state.collect_step -= 1
+            else:
+                st.session_state.step = 2
+                st.session_state.collect_step = 1
+                st.session_state.results = {}
+            st.rerun()
+
+    with col_retry:
+        if st.button("🔄 Relancer"):
+            st.session_state.results.pop(key, None)
+            st.rerun()
+
+    with col_next:
+        next_label = "Valider et continuer →" if cs < len(COLLECT_STEPS) else "✅ Valider et générer les fichiers"
+        if st.button(next_label, type="primary"):
+            if cs < len(COLLECT_STEPS):
+                st.session_state.collect_step += 1
+                st.rerun()
+            else:
+                # Toutes les sous-étapes validées → générer les fichiers
+                results = st.session_state.results
+                mat_raw = results.get("maternites", {})
+                maternites_flat = [
+                    dict(m, _cp_recherche=cp)
+                    for cp, mats in (mat_raw.items() if isinstance(mat_raw, dict) else {}.items())
+                    for m in mats
+                ]
+                today     = date.today().strftime("%Y-%m-%d")
+                zone_slug = f"DIP_{dept_nom or dept_code}".replace(" ", "_")[:30]
+                out_dir   = Path(__file__).parent / "output"
+                out_dir.mkdir(exist_ok=True)
+                xlsx_path = str(out_dir / f"donnees_{zone_slug}_{today}.xlsx")
+                docx_path = str(out_dir / f"synthese_{zone_slug}_{today}.docx")
+                zone_nom  = f"{dept_nom} ({dept_code})" if dept_nom else dept_code
+
+                with st.spinner("Génération du fichier Excel…"):
+                    generate_excel(
+                        output_path=xlsx_path, zone_nom=zone_nom,
+                        dept_code=dept_code, dept_nom=dept_nom, region=region,
+                        communes_data=results.get("insee", []),
+                        pj_data=results.get("pages_jaunes", []),
+                        maternites=maternites_flat,
+                        lactariums=results.get("lactariums", []),
+                        sages_femmes=results.get("sages_femmes", []),
+                        pmi=results.get("pmi", []),
+                    )
+                    st.session_state.xlsx_bytes = open(xlsx_path, "rb").read()
+
+                with st.spinner("Génération du document Word…"):
+                    generate_word(
+                        output_path=docx_path, zone_nom=zone_nom,
+                        dept_code=dept_code, dept_nom=dept_nom, region=region,
+                        communes=communes_flat,
+                        communes_data=results.get("insee", []),
+                        pj_data=results.get("pages_jaunes", []),
+                        maternites=maternites_flat,
+                        lactariums=results.get("lactariums", []),
+                        sages_femmes=results.get("sages_femmes", []),
+                        pmi=results.get("pmi", []),
+                    )
+                    st.session_state.docx_bytes = open(docx_path, "rb").read()
+
+                st.session_state.step = 4
+                st.session_state.collect_step = 1
+                st.rerun()
 
 
 # ══════════════════════════════════════════════════════════════════════════════

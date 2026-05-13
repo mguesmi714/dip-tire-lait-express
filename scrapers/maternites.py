@@ -1,7 +1,12 @@
 """
 Scraper maternités — journaldesfemmes.fr
-URL pattern : https://www.journaldesfemmes.fr/maman/maternite/{commune_slug}/ville-{code_insee}
-Ex : https://www.journaldesfemmes.fr/maman/maternite/annonay/ville-07010
+
+Stratégie :
+1. Page département  → liste des URLs de fiches maternité
+2. Chaque fiche      → nom exact (h1 avant " à "), CP exact (1er CP du texte),
+                       niveau, statut public/privé
+3. Filtre strict     → ne garder que les maternités dont le CP correspond
+                       exactement au code postal recherché
 """
 
 import re
@@ -12,155 +17,172 @@ from bs4 import BeautifulSoup
 from config import HEADERS, REQUEST_DELAY
 
 
-_BASE = "https://www.journaldesfemmes.fr/maman/maternite/{slug}/ville-{cog}"
+_DEPT_PAGE  = "https://www.journaldesfemmes.fr/maman/maternite/{dept_slug}/departement-{dept_code}"
+_GEO_DEPT   = "https://geo.api.gouv.fr/departements/{code}?fields=nom"
 
 
-def _slugify(nom: str) -> str:
-    """'Saint-Étienne' → 'saint-etienne'"""
-    nom = nom.lower().strip()
-    # Supprimer les accents
-    nom = "".join(
-        c for c in unicodedata.normalize("NFD", nom)
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _slugify(text: str) -> str:
+    text = text.lower().strip()
+    text = "".join(
+        c for c in unicodedata.normalize("NFD", text)
         if unicodedata.category(c) != "Mn"
     )
-    # Remplacer espaces et tirets multiples
-    nom = re.sub(r"[\s_]+", "-", nom)
-    nom = re.sub(r"[^a-z0-9\-]", "", nom)
-    nom = re.sub(r"-+", "-", nom).strip("-")
-    return nom
+    text = re.sub(r"[\s_']+", "-", text)
+    text = re.sub(r"[^a-z0-9\-]", "", text)
+    return re.sub(r"-+", "-", text).strip("-")
 
 
-def _scrape_maternite_page(url: str) -> list[dict]:
+def _dept_nom(dept_code: str) -> str:
+    """Récupère le nom officiel du département via l'API geo.gouv.fr."""
+    try:
+        r = requests.get(_GEO_DEPT.format(code=dept_code), timeout=8)
+        return r.json().get("nom", "")
+    except Exception:
+        return ""
+
+
+def _get_maternite_links(dept_code: str) -> list[str]:
     """
-    Scrape une page maternité journaldesfemmes.fr.
-    Retourne la liste des maternités trouvées (souvent 1 ou quelques-unes).
+    Retourne toutes les URLs de fiches maternité du département.
+    Format URL : /maman/maternite/maternite-xxx/maternite-YYYYYYY
     """
-    results = []
+    dept_nom = _dept_nom(dept_code)
+    if not dept_nom:
+        return []
+
+    dept_slug = _slugify(dept_nom)
+    url = _DEPT_PAGE.format(dept_slug=dept_slug, dept_code=dept_code)
+
     try:
         time.sleep(REQUEST_DELAY)
         r = requests.get(url, headers=HEADERS, timeout=20)
-        if r.status_code == 404:
+        if r.status_code != 200:
             return []
-        r.raise_for_status()
         soup = BeautifulSoup(r.text, "html.parser")
-
-        # ── Tenter les différentes structures de page ──────────────────────────
-
-        # Structure 1 : cartes maternités avec classe spécifique
-        cards = soup.select(
-            "[class*='maternite'], [class*='maternity'], "
-            "[class*='hospital'], article, .card, .result-item"
-        )
-
-        # Si pas de cartes distinctes, chercher le bloc principal
-        if not cards:
-            main = soup.select_one("main, #main, .main-content, [role='main']")
-            if main:
-                cards = [main]
-
-        for card in cards:
-            text = card.get_text(" ", strip=True)
-            if len(text) < 10:
-                continue
-
-            # Nom de la maternité
-            nom_el = card.select_one("h1, h2, h3, h4, strong, .title, [class*='name']")
-            nom = nom_el.get_text(strip=True) if nom_el else ""
-
-            # Filtrer les faux positifs (menus, footers…)
-            if not nom or len(nom) < 5:
-                continue
-            if any(kw in nom.lower() for kw in ["accueil", "menu", "recherche", "connexion"]):
-                continue
-
-            # Statut public / privé
-            statut = ""
-            text_lower = text.lower()
-            if "publique" in text_lower or "public" in text_lower:
-                statut = "Public"
-            elif "privé" in text_lower or "clinique" in text_lower or "prive" in text_lower:
-                statut = "Privé"
-
-            # Niveau (1, 2 ou 3)
-            niveau = ""
-            m = re.search(r"niveau\s+([1-3IVX]+)", text, re.IGNORECASE)
-            if m:
-                niveau = f"Niveau {m.group(1)}"
-
-            # Ville + CP dans le texte
-            ville = ""
-            cp_trouve = ""
-            cp_match = re.search(r"\b(\d{5})\b", text)
-            if cp_match:
-                cp_trouve = cp_match.group(1)
-            ville_match = re.search(r"([A-ZÀ-Ÿa-zà-ÿ\s\-]+)\s*\(\d{5}\)", text)
-            if ville_match:
-                ville = ville_match.group(1).strip()
-
-            # Nombre d'accouchements
-            nb_acc = ""
-            acc_match = re.search(r"(\d[\d\s]*)\s*accouchements?", text, re.IGNORECASE)
-            if acc_match:
-                nb_acc = acc_match.group(1).strip()
-
-            results.append({
-                "nom":                 nom,
-                "statut":              statut,
-                "type_niveau":         niveau,
-                "nb_accouchements_an": nb_acc,
-                "ville":               ville,
-                "cp":                  cp_trouve,
-                "url_source":          url,
-            })
-
-        # Dédoublonner par nom
-        seen = set()
-        unique = []
-        for r_ in results:
-            key = r_["nom"].strip().upper()
-            if key not in seen:
-                seen.add(key)
-                unique.append(r_)
-
-        return unique
-
+        base = "https://www.journaldesfemmes.fr"
+        links = []
+        for a in soup.select('a[href*="/maternite-"]'):
+            href = a.get("href", "")
+            # Garder uniquement les fiches individuelles (pas les pages ville)
+            if re.search(r"/maternite-\d+$", href):
+                full = href if href.startswith("http") else base + href
+                if full not in links:
+                    links.append(full)
+        return links
     except Exception:
         return []
 
 
+def _scrape_fiche(url: str, source_date: str) -> dict | None:
+    """
+    Scrape une fiche maternité individuelle.
+    Retourne un dict ou None si la page est inaccessible.
+    """
+    try:
+        time.sleep(REQUEST_DELAY)
+        r = requests.get(url, headers=HEADERS, timeout=20)
+        if r.status_code != 200:
+            return None
+        soup = BeautifulSoup(r.text, "html.parser")
+        text = soup.get_text(" ", strip=True)
+
+        # ── Nom exact : h1 avant " à " ─────────────────────────────────────
+        h1_el = soup.select_one("h1")
+        if not h1_el:
+            return None
+        h1_text = h1_el.get_text(strip=True)
+        nom = re.split(r"\s+[àa]\s+", h1_text)[0].strip()
+
+        if not nom or len(nom) < 5:
+            return None
+
+        # ── CP exact : premier code postal (5 chiffres) dans la page ───────
+        # Le premier trouvé est celui de l'adresse de la maternité
+        cp_all = re.findall(r"\b(\d{5})\b", text)
+        cp = cp_all[0] if cp_all else ""
+
+        # ── Ville : mot(s) après le CP dans la page ─────────────────────────
+        ville = ""
+        ville_match = re.search(r"\b" + re.escape(cp) + r"\s+([A-ZÀ-Ÿa-zà-ÿ][A-ZÀ-Ÿa-zà-ÿ\s\-]*)", text)
+        if ville_match:
+            ville = ville_match.group(1).split()[0]  # juste le premier mot
+
+        # ── Statut public / privé ───────────────────────────────────────────
+        statut = ""
+        if re.search(r"maternit[ée]\s+publique", text, re.IGNORECASE):
+            statut = "Public"
+        elif re.search(r"maternit[ée]\s+priv[ée]|clinique priv[ée]", text, re.IGNORECASE):
+            statut = "Privé"
+
+        # ── Niveau ──────────────────────────────────────────────────────────
+        niveau = ""
+        m = re.search(r"niveau\s+([1-3])", text, re.IGNORECASE)
+        if m:
+            niveau = f"Niveau {m.group(1)}"
+
+        # ── Nb accouchements ────────────────────────────────────────────────
+        nb_acc = ""
+        acc_match = re.search(r"([\d\s]+)\s*accouchements?", text, re.IGNORECASE)
+        if acc_match:
+            nb_acc = acc_match.group(1).strip().replace(" ", " ")
+
+        return {
+            "nom":                 nom,
+            "cp":                  cp,
+            "ville":               ville,
+            "statut":              statut,
+            "type_niveau":         niveau,
+            "nb_accouchements_an": nb_acc,
+            "url_source":          url,
+            "_source":             f"Journal des Femmes — consulté le {source_date}",
+        }
+
+    except Exception:
+        return None
+
+
+# ── Point d'entrée ────────────────────────────────────────────────────────────
+
 def get_maternites_par_cp(cp_communes: dict[str, list[dict]]) -> dict[str, list[dict]]:
     """
-    Pour chaque CP, scrape les maternités de chaque commune associée.
+    Pour chaque CP, retourne les maternités dont le CP exact correspond.
 
     Args:
-        cp_communes: dict { "07100": [{"nom": "Annonay", "code_insee": "07010", ...}], ... }
+        cp_communes: dict { "92700": [...communes...], "07110": [...], ... }
 
     Returns:
-        dict { "07100": [{"nom": "Maternité d'Ardèche Nord", ...}], "07200": [], ... }
+        dict { "92700": [{"nom": "Maternité Louis Mourier", ...}], "07110": [], ... }
+        Liste vide si aucune maternité exactement dans ce CP.
     """
-    result: dict[str, list[dict]] = {}
     source_date = time.strftime("%d/%m/%Y")
+    result: dict[str, list[dict]] = {cp: [] for cp in cp_communes}
 
-    for cp, communes in cp_communes.items():
-        maternites_cp: list[dict] = []
+    # Grouper les CP par département pour ne charger la page dept qu'une seule fois
+    dept_to_cps: dict[str, list[str]] = {}
+    for cp in cp_communes:
+        dept = cp[:3] if cp.startswith("97") else cp[:2]
+        dept_to_cps.setdefault(dept, []).append(cp)
 
-        for commune in communes:
-            cog = commune.get("code_insee") or commune.get("code", "")
-            nom_commune = commune.get("nom", "")
+    for dept_code, cps in dept_to_cps.items():
+        # 1. Récupérer toutes les fiches du département
+        fiches_urls = _get_maternite_links(dept_code)
 
-            if not cog or not nom_commune:
+        if not fiches_urls:
+            continue
+
+        # 2. Scraper chaque fiche
+        for fiche_url in fiches_urls:
+            fiche = _scrape_fiche(fiche_url, source_date)
+            if not fiche:
                 continue
 
-            slug = _slugify(nom_commune)
-            url  = _BASE.format(slug=slug, cog=cog)
+            cp_fiche = fiche.get("cp", "")
 
-            found = _scrape_maternite_page(url)
-            for m in found:
-                m["_source"]       = f"Journal des Femmes — consulté le {source_date}"
-                m["_cp_recherche"] = cp
-                m["_url"]          = url
-                maternites_cp.append(m)
-
-        result[cp] = maternites_cp
+            # 3. Filtre strict : affecter au CP qui correspond exactement
+            if cp_fiche in result:
+                fiche["_cp_recherche"] = cp_fiche
+                result[cp_fiche].append(fiche)
 
     return result
