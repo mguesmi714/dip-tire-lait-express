@@ -1,0 +1,23 @@
+# Fichiers générés
+output/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyc
+.venv/
+venv/
+env/
+.env
+
+# Playwright
+playwright/.local-chromium/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
