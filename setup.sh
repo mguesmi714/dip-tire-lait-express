@@ -1,2 +1,2 @@
 #!/bin/bash
-python -m camoufox fetch
+playwright install chromium
