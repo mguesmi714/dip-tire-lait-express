@@ -12,7 +12,12 @@ Stratégie :
 
 import re
 import time
-from playwright.sync_api import sync_playwright
+
+try:
+    from playwright.sync_api import sync_playwright
+    _PLAYWRIGHT_OK = True
+except ImportError:
+    _PLAYWRIGHT_OK = False
 
 _BASE_URL = "https://www.insee.fr/fr/statistiques/zones/1405599"
 _MAX_COMMUNES_PER_REQUEST = 20   # limite prudente pour l'URL
@@ -83,6 +88,10 @@ def _scrape_batch(cog_codes: list[str]) -> dict[str, dict]:
     Scrape le comparateur INSEE pour un lot de codes COG.
     Retourne dict { "07029": {indicateurs...}, "07058": {...}, ... }
     """
+    if not _PLAYWRIGHT_OK:
+        print("[INSEE] Playwright non disponible — données INSEE non collectées")
+        return {cog: {} for cog in cog_codes}
+
     geo_param = "+".join(f"COM-{cog}" for cog in cog_codes)
     url = f"{_BASE_URL}?geo={geo_param}&debut=0"
 
