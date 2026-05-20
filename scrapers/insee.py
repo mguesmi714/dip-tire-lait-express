@@ -163,15 +163,35 @@ def get_all_communes_data(communes: list[dict]) -> list[dict]:
     """
     source_date = time.strftime("%d/%m/%Y")
 
-    # Construire la liste des codes COG valides
+    # Séparer communes avec code COG valide et celles sans
     commune_by_cog: dict[str, dict] = {}
+    communes_sans_cog: list[dict] = []
     for c in communes:
         cog = c.get("code_insee") or c.get("code", "")
         if cog and re.match(r"^\d{5}$", cog):
             commune_by_cog[cog] = c
+        else:
+            communes_sans_cog.append(c)
+
+    # Communes sans code COG → ligne vide directement
+    final_sans_cog: list[dict] = []
+    all_keys = list(dict.fromkeys(LABEL_MAP.values()))
+    for c in communes_sans_cog:
+        row: dict = {
+            "commune":     c.get("nom", "?"),
+            "code_insee":  "",
+            "cp":          c.get("cp", ""),
+            "departement": c.get("departement", {}).get("nom", "") if isinstance(c.get("departement"), dict) else c.get("departement", ""),
+            "region":      c.get("region", {}).get("nom", "") if isinstance(c.get("region"), dict) else c.get("region", ""),
+            "_source":     f"INSEE Comparateur de territoires — consulté le {source_date}",
+            "_statut":     "Code INSEE manquant",
+        }
+        for k in all_keys:
+            row[k] = None
+        final_sans_cog.append(row)
 
     if not commune_by_cog:
-        return []
+        return final_sans_cog
 
     # Scraper par lots de MAX_COMMUNES_PER_REQUEST
     all_scraped: dict[str, dict] = {}
@@ -212,7 +232,7 @@ def get_all_communes_data(communes: list[dict]) -> list[dict]:
 
         final.append(row)
 
-    return final
+    return final + final_sans_cog
 
 
 # ── Indicateurs : type de calcul pour la ligne TOTAL ─────────────────────────

@@ -116,13 +116,17 @@ def _section_pharmacies(doc, pj_data):
     for r in pj_data:
         _heading(doc, r["commune"] + f" ({r['cp']})", 3)
         _bullet(doc, f"Pharmacies : {r.get('nb_pharmacies', 0)}")
-        if r.get("noms_pharmacies"):
-            for nom in r["noms_pharmacies"]:
-                _bullet(doc, nom, level=1)
+        noms_ph  = r.get("noms_pharmacies", [])
+        adr_ph   = r.get("adresses_pharmacies", [])
+        for i, nom in enumerate(noms_ph):
+            adresse = adr_ph[i] if i < len(adr_ph) else ""
+            _bullet(doc, f"{nom} — {adresse}" if adresse else nom, level=1)
         _bullet(doc, f"Matériel médical : {r.get('nb_materiel_medical', 0)}")
-        if r.get("noms_materiel_medical"):
-            for nom in r["noms_materiel_medical"]:
-                _bullet(doc, nom, level=1)
+        noms_mm  = r.get("noms_materiel_medical", [])
+        adr_mm   = r.get("adresses_materiel_medical", [])
+        for i, nom in enumerate(noms_mm):
+            adresse = adr_mm[i] if i < len(adr_mm) else ""
+            _bullet(doc, f"{nom} — {adresse}" if adresse else nom, level=1)
     _section_sep(doc)
 
 
@@ -152,11 +156,23 @@ def _section_maternites(doc, maternites, communes_data):
 def _section_lactariums(doc, lactariums):
     _heading(doc, "5. Lactariums", 1)
     _heading(doc, "Source : Association des Lactariums de France", 2)
+    if not lactariums:
+        _bullet(doc, "Aucun lactarium dans cette zone.")
     for lac in lactariums:
-        line = lac.get("nom", "")
+        parts = [lac.get("nom", "")]
+        if lac.get("adresse"):
+            parts.append(lac["adresse"])
         if lac.get("telephone"):
-            line += f" — Tél. {lac['telephone']}"
-        _bullet(doc, line)
+            parts.append(f"Tél. {lac['telephone']}")
+        if lac.get("email"):
+            parts.append(lac["email"])
+        if lac.get("type"):
+            parts.append(lac["type"])
+        if lac.get("don_anonyme") == "Oui":
+            parts.append("Don de lait anonyme possible")
+        _bullet(doc, " | ".join(filter(None, parts)))
+        for membre in lac.get("equipe", []):
+            _bullet(doc, membre, level=1)
     _section_sep(doc)
 
 
@@ -164,7 +180,11 @@ def _section_sages_femmes(doc, sages_femmes):
     _heading(doc, "6. Sages-femmes libérales", 1)
     _heading(doc, f"Source : Ordre national des sages-femmes — {len(sages_femmes)} sage(s)-femme(s) (après dédoublonnage)", 2)
     for sf in sages_femmes:
-        parts = [f"{sf.get('nom', '')} {sf.get('prenom', '')}".strip()]
+        cp_display = sf.get("code_postaux_display") or sf.get("cp", "")
+        nom_line = f"{sf.get('nom', '')} {sf.get('prenom', '')}".strip()
+        if cp_display:
+            nom_line += f" ({cp_display})"
+        parts = [nom_line]
         if sf.get("adresse"):
             parts.append(sf["adresse"])
         if sf.get("telephone"):
@@ -177,14 +197,20 @@ def _section_sages_femmes(doc, sages_femmes):
 
 def _section_pmi(doc, pmi):
     _heading(doc, "7. Protection Maternelle et Infantile (PMI)", 1)
-    _heading(doc, "Source : AlloPMI.fr", 2)
+    _heading(doc, f"Source : AlloPMI.fr — {len(pmi)} centre(s)", 2)
+    if not pmi:
+        _bullet(doc, "Aucune PMI dans cette zone.")
     for p in pmi:
-        line = p.get("nom", "")
+        parts = [p.get("nom", "")]
         if p.get("adresse"):
-            line += f" — {p['adresse']}"
+            parts.append(p["adresse"])
         if p.get("telephone"):
-            line += f" — Tél. {p['telephone']}"
-        _bullet(doc, line)
+            parts.append(f"Tél. {p['telephone']}")
+        if p.get("email"):
+            parts.append(p["email"])
+        if p.get("horaires"):
+            parts.append(p["horaires"])
+        _bullet(doc, " | ".join(filter(None, parts)))
     _section_sep(doc)
 
 

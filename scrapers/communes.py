@@ -1,124 +1,200 @@
 """
-Scraper annuaire-administration.com
-Résout un code postal → liste de communes avec leur nom officiel.
-URL pattern : https://www.annuaire-administration.com/code-postal/{cp}/
+Résout un code postal → liste de communes avec leur nom et code INSEE.
+
+Stratégie :
+1. Annuaire-administration.com (page département) → noms officiels attendus par l'utilisateur
+2. geo.api.gouv.fr → codes INSEE pour chaque nom
+3. Fusion : on garde les noms de l'annuaire + codes INSEE de l'API
 """
 
 import re
 import time
+import unicodedata
 import requests
 from bs4 import BeautifulSoup
 from config import HEADERS, REQUEST_DELAY
 
 
-_BASE = "https://www.annuaire-administration.com/code-postal/{cp}/"
-_DEPT_BASE = "https://www.annuaire-administration.com/code-postal/{dept}/"
+_DEPT_PAGE  = "https://www.annuaire-administration.com/code-postal/departement/{slug}.html"
+_GEO_DEPT   = "https://geo.api.gouv.fr/departements/{code}?fields=nom"
+_GEO_CP     = "https://geo.api.gouv.fr/communes?codePostal={cp}&fields=nom,code,departement,region&format=json"
+
+# Cache des pages département pour ne pas les télécharger plusieurs fois
+_dept_cache: dict[str, dict[str, list[str]]] = {}   # {dept_code: {cp: [noms]}}
 
 
 def _extract_dept(cp: str) -> str:
-    """Extrait le code département depuis un CP (ex. '56000' → '56')."""
     if cp.startswith("97") or cp.startswith("98"):
         return cp[:3]
     return cp[:2]
 
 
-def get_communes_for_cp(cp: str) -> list[dict]:
-    """
-    Récupère la liste des communes pour un code postal donné.
+def _slugify(text: str) -> str:
+    text = text.lower().strip()
+    text = "".join(
+        c for c in unicodedata.normalize("NFD", text)
+        if unicodedata.category(c) != "Mn"
+    )
+    text = re.sub(r"[\s_]+", "-", text)
+    text = re.sub(r"[^a-z0-9\-]", "", text)
+    return re.sub(r"-+", "-", text).strip("-")
 
-    Returns:
-        liste de dicts : {"nom": str, "cp": str, "dept": str}
+
+def _dept_nom(dept_code: str) -> str:
+    try:
+        r = requests.get(_GEO_DEPT.format(code=dept_code), timeout=8)
+        return r.json().get("nom", "")
+    except Exception:
+        return ""
+
+
+def _load_dept_page(dept_code: str) -> dict[str, list[str]]:
     """
-    url = _BASE.format(cp=cp)
-    communes = []
+    Charge la page département et retourne un dict {cp: [noms_communes]}.
+    Le résultat est mis en cache.
+    """
+    if dept_code in _dept_cache:
+        return _dept_cache[dept_code]
+
+    dept_nom = _dept_nom(dept_code)
+    if not dept_nom:
+        _dept_cache[dept_code] = {}
+        return {}
+
+    slug = _slugify(dept_nom)
+    url  = _DEPT_PAGE.format(slug=slug)
 
     try:
         time.sleep(REQUEST_DELAY)
         r = requests.get(url, headers=HEADERS, timeout=20)
-        r.raise_for_status()
-        soup = BeautifulSoup(r.text, "html.parser")
+        if r.status_code != 200:
+            _dept_cache[dept_code] = {}
+            return {}
 
-        # Les communes sont dans des liens ou cellules de tableau
-        # Chercher d'abord dans un tableau
-        for tr in soup.select("table tr"):
-            cells = tr.select("td, th")
-            for cell in cells:
-                text = cell.get_text(strip=True)
-                # Ignorer les en-têtes et cellules vides
-                if text and len(text) > 1 and not text.isdigit():
-                    # Vérifier que ce n'est pas un CP (5 chiffres)
-                    if not re.match(r"^\d{5}$", text):
-                        communes.append({
-                            "nom": text,
-                            "cp": cp,
-                            "dept": _extract_dept(cp),
-                        })
+        soup   = BeautifulSoup(r.text, "html.parser")
+        result: dict[str, list[str]] = {}
 
-        # Fallback : chercher dans des listes ou liens
-        if not communes:
-            for a in soup.select("a, li, .commune, [class*='commune']"):
-                text = a.get_text(strip=True)
-                if (text and len(text) > 2
-                        and not re.match(r"^\d+$", text)
-                        and len(text) < 60):
-                    communes.append({
-                        "nom": text,
-                        "cp": cp,
-                        "dept": _extract_dept(cp),
-                    })
+        # Chercher le tableau CP → Communes : 1re ligne = "Codes Postaux | Communes"
+        for table in soup.find_all("table"):
+            first_row = table.find("tr")
+            if not first_row:
+                continue
+            first_text = first_row.get_text(" ", strip=True)
+            if "Codes Postaux" not in first_text or "Communes" not in first_text:
+                continue
 
-        # Dédoublonner par nom
-        seen = set()
-        unique = []
-        for c in communes:
-            key = c["nom"].upper()
-            if key not in seen and not any(
-                kw in c["nom"].lower()
-                for kw in ["accueil", "menu", "retour", "page", "france",
-                            "administration", "annuaire", "recherche"]
-            ):
-                seen.add(key)
-                unique.append(c)
+            for row in table.find_all("tr"):
+                tds = row.find_all("td")
+                if len(tds) < 2:
+                    continue
 
-        if unique:
-            return unique
+                # td[0] contient "Code Postal XXXXX"
+                cp_match = re.search(r"\b(\d{5})\b", tds[0].get_text())
+                if not cp_match:
+                    continue
+                cp = cp_match.group(1)
 
+                # td[1] : les noms de communes dans les <a> ou en texte brut
+                noms = [a.get_text(strip=True) for a in tds[1].find_all("a") if a.get_text(strip=True)]
+                if not noms:
+                    # Fallback : texte brut séparé par des espaces (moins fiable)
+                    noms = [n.strip() for n in tds[1].get_text(" ", strip=True).split("  ") if n.strip()]
+
+                if noms:
+                    result[cp] = noms
+
+            if result:
+                break
+
+        _dept_cache[dept_code] = result
+        return result
+
+    except Exception:
+        _dept_cache[dept_code] = {}
+        return {}
+
+
+def _normalize(name: str) -> str:
+    """Normalise un nom pour la comparaison (minuscule, sans accents)."""
+    name = name.lower().strip()
+    return "".join(
+        c for c in unicodedata.normalize("NFD", name)
+        if unicodedata.category(c) != "Mn"
+    )
+
+
+def get_communes_for_cp(cp: str) -> list[dict]:
+    """
+    Retourne la liste des communes pour un code postal.
+    Noms depuis annuaire-administration.com + codes INSEE depuis geo.api.gouv.fr.
+    """
+    dept_code = _extract_dept(cp)
+
+    # 1. Noms depuis annuaire-administration.com
+    dept_data = _load_dept_page(dept_code)
+    noms_annuaire: list[str] = dept_data.get(cp, [])
+
+    # 2. Données INSEE depuis geo.api.gouv.fr
+    geo_data: list[dict] = []
+    try:
+        r = requests.get(_GEO_CP.format(cp=cp), timeout=10)
+        if r.status_code == 200:
+            geo_data = r.json()
     except Exception:
         pass
 
-    # Fallback : API geo.api.gouv.fr
-    return _fallback_geo_api(cp)
+    # Index geo par nom normalisé → pour retrouver le code INSEE
+    geo_by_norm: dict[str, dict] = {
+        _normalize(c.get("nom", "")): c
+        for c in geo_data
+    }
 
+    # 3. Fusion : garder noms annuaire + associer code INSEE si trouvé
+    communes: list[dict] = []
+    matched_geo_codes: set[str] = set()
 
-def _fallback_geo_api(cp: str) -> list[dict]:
-    """Fallback via l'API geo.api.gouv.fr si annuaire-administration échoue."""
-    try:
-        url = f"https://geo.api.gouv.fr/communes?codePostal={cp}&fields=nom,code,departement&format=json"
-        r = requests.get(url, timeout=10)
-        r.raise_for_status()
-        data = r.json()
-        return [
+    for nom in noms_annuaire:
+        norm = _normalize(nom)
+        geo  = geo_by_norm.get(norm)
+        code_insee = geo.get("code", "") if geo else ""
+        departement = geo.get("departement", {}) if geo else {"code": dept_code, "nom": ""}
+        region      = geo.get("region", {})       if geo else {}
+        if geo:
+            matched_geo_codes.add(geo.get("code", ""))
+        communes.append({
+            "nom":         nom,
+            "cp":          cp,
+            "dept":        dept_code,
+            "code_insee":  code_insee,
+            "departement": departement,
+            "region":      region,
+        })
+
+    # 4. Si annuaire vide → utiliser geo.api.gouv.fr seul (fallback)
+    if not communes and geo_data:
+        communes = [
             {
-                "nom": c.get("nom", ""),
-                "cp": cp,
-                "dept": c.get("departement", {}).get("code", cp[:2]),
-                "code_insee": c.get("code", ""),
+                "nom":         c.get("nom", ""),
+                "cp":          cp,
+                "dept":        dept_code,
+                "code_insee":  c.get("code", ""),
+                "departement": c.get("departement", {}),
+                "region":      c.get("region", {}),
             }
-            for c in data
+            for c in geo_data
         ]
-    except Exception:
-        return [{"nom": f"Commune_{cp}", "cp": cp, "dept": cp[:2], "_statut": "non résolu"}]
+    elif not communes:
+        communes = [{"nom": f"Commune_{cp}", "cp": cp, "dept": dept_code,
+                     "code_insee": "", "_statut": "non résolu"}]
+
+    return communes
 
 
 def get_communes_for_all_cp(codes_postaux: list[str]) -> dict[str, list[dict]]:
     """
     Pour chaque code postal, retourne la liste des communes.
-
-    Returns:
-        dict { "56000": [{"nom": "Vannes", "cp": "56000", ...}], ... }
     """
     result: dict[str, list[dict]] = {}
     for cp in codes_postaux:
-        communes = get_communes_for_cp(cp)
-        result[cp] = communes
+        result[cp] = get_communes_for_cp(cp)
     return result

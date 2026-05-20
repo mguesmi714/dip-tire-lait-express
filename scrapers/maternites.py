@@ -186,3 +186,121 @@ def get_maternites_par_cp(cp_communes: dict[str, list[dict]]) -> dict[str, list[
                 result[cp_fiche].append(fiche)
 
     return result
+
+
+# ── Scraper Pages Jaunes ────────────────────────────────────────────────────
+
+def verifier_pages_jaunes(url: str) -> dict:
+    """
+    Vérifie les résultats d'une recherche sur Pages Jaunes.
+    Args:
+        url: URL de la recherche Pages Jaunes.
+
+    Returns:
+        dict: Contient le nombre de résultats et si le mot "couvre" est présent.
+    """
+    try:
+        time.sleep(REQUEST_DELAY)
+        r = requests.get(url, headers=HEADERS, timeout=20)
+        if r.status_code != 200:
+            return {
+                "erreur": "Statut HTTP non valide",
+                "code_statut": r.status_code,
+                "contenu": r.text[:500]  # Inclure un extrait du contenu pour diagnostic
+            }
+
+        soup = BeautifulSoup(r.text, "html.parser")
+
+        # Extraire le nombre de résultats
+        resultats_text = soup.select_one(".result-summary-container")
+        if not resultats_text:
+            return {
+                "erreur": "Impossible de trouver le conteneur des résultats",
+                "contenu": r.text[:500]
+            }
+
+        resultats_text = resultats_text.get_text(strip=True)
+        nombre_resultats = int(re.search(r"\d+", resultats_text).group())
+
+        # Vérifier la présence du mot "couvre"
+        contient_couvre = "couvre" in soup.get_text()
+
+        return {
+            "nombre_resultats": nombre_resultats,
+            "contient_couvre": contient_couvre
+        }
+
+    except Exception as e:
+        return {
+            "erreur": "Exception levée",
+            "details": str(e)
+        }
+
+
+def verifier_pages_jaunes_commune(url: str, commune: str) -> dict:
+    """
+    Vérifie les résultats d'une recherche sur Pages Jaunes pour une commune spécifique.
+    Args:
+        url: URL de la recherche Pages Jaunes.
+        commune: Nom exact de la commune à vérifier.
+
+    Returns:
+        dict: Contient les résultats filtrés pour la commune.
+    """
+    try:
+        time.sleep(REQUEST_DELAY)
+        r = requests.get(url, headers=HEADERS, timeout=20)
+        if r.status_code != 200:
+            return {
+                "erreur": "Statut HTTP non valide",
+                "code_statut": r.status_code,
+                "contenu": r.text[:500]  # Inclure un extrait du contenu pour diagnostic
+            }
+
+        soup = BeautifulSoup(r.text, "html.parser")
+
+        # Extraire les résultats
+        resultats = []
+        exclusions = []  # Pour loguer les résultats exclus
+        for item in soup.select(".bi-bloc"):
+            nom = item.select_one(".denomination-links").get_text(strip=True) if item.select_one(".denomination-links") else ""
+            adresse = item.select_one(".adresse-container").get_text(strip=True) if item.select_one(".adresse-container") else ""
+
+            # Vérification stricte ligne par ligne
+            lignes_adresse = adresse.split(",")  # Découper l'adresse en lignes
+            adresse_valide = False
+            for ligne in lignes_adresse:
+                ligne = ligne.strip().lower()
+                if commune.lower() in ligne and "couvre" not in ligne:
+                    # Correspondance stricte : vérifier que la commune est isolée
+                    if re.fullmatch(rf".*\b{re.escape(commune.lower())}\b.*", ligne):
+                        adresse_valide = True
+                        break
+
+            if adresse_valide:
+                resultats.append({
+                    "nom": nom,
+                    "adresse": adresse
+                })
+            else:
+                exclusions.append({"nom": nom, "adresse": adresse, "raison": "Contient 'couvre' ou ne correspond pas exactement à la commune"})
+
+        return {
+            "commune": commune,
+            "resultats": resultats,
+            "nombre_resultats": len(resultats),
+            "exclusions": exclusions  # Inclure les exclusions pour diagnostic
+        }
+
+    except Exception as e:
+        return {
+            "erreur": "Exception levée",
+            "details": str(e)
+        }
+
+# Exemple d'utilisation
+if __name__ == "__main__":
+    url_test = "https://www.pagesjaunes.fr/annuaire/chercherlespros?quoiqui=magasin+materiel+medical&ou=Vannes+%2856000%29&univers=pagesjaunes&idOu="
+    commune_test = "Ambon"
+    resultat = verifier_pages_jaunes_commune(url_test, commune_test)
+    print(resultat)

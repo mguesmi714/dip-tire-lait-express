@@ -241,8 +241,8 @@ def collecter_donnees(
                 exe.submit(run, "pages_jaunes", get_pharmacies_and_medical,  communes_pj),
                 exe.submit(run, "maternites",   get_maternites_par_cp,       cp_uniques),
                 exe.submit(run, "lactariums",   get_lactariums,              dept_code, region),
-                exe.submit(run, "sages_femmes", get_sages_femmes,            communes_pj),
-                exe.submit(run, "pmi",          get_pmi,                     dept_code, dept_nom),
+                exe.submit(run, "sages_femmes", get_sages_femmes,            dept_code, cp_uniques),
+                exe.submit(run, "pmi",          get_pmi,                     dept_code, dept_nom, cp_uniques, communes_pj),
             ]
             for f in as_completed(futures):
                 key, data, err = f.result()

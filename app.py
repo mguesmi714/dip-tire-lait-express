@@ -16,7 +16,7 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).parent))
 
 from scrapers.communes import get_communes_for_all_cp
-from scrapers.insee import get_all_communes_data
+from scrapers.insee import get_all_communes_data, compute_zone_totals
 from scrapers.pages_jaunes import get_pharmacies_and_medical
 from scrapers.maternites import get_maternites_par_cp
 from scrapers.lactariums import get_lactariums
@@ -65,6 +65,7 @@ def _init():
         "dept_nom": "",
         "region": "",
         "results": {},
+        "communes_flat": [],
         "xlsx_bytes": None,
         "docx_bytes": None,
     }
@@ -94,6 +95,112 @@ def _inferer_zone(cp_uniques: list[str]) -> tuple[str, str, str]:
     except Exception:
         pass
     return cp[:2], "", ""
+
+
+# ── Tableau INSEE pivoté : indicateurs en lignes, communes en colonnes ─────────
+
+# (clé interne, libellé affiché, type de calcul pour la colonne TOTAL ZONE)
+_INDICATEURS = [
+    # Population
+    ("pop_2022",             "Population en 2022",                          "Somme"),
+    ("densite_2022",         "Densité (hab/km²)",                           "Pop / Superf."),
+    ("superficie_km2",       "Superficie (km²)",                            "Somme"),
+    ("var_pop_2016_2022",    "Variation pop. 2016-2022 (%)",                 "Moy. pond."),
+    ("solde_naturel",        "Solde naturel (%)",                           "Moy. pond."),
+    ("solde_migratoire",     "Solde migratoire (%)",                        "Moy. pond."),
+    ("nb_menages_2022",      "Nb ménages 2022",                             "Somme"),
+    ("naissances_2022",      "Naissances domiciliées",                      "Somme"),
+    ("deces_2022",           "Décès domiciliés",                            "Somme"),
+    # Logement
+    ("nb_logements_2022",          "Nb logements 2022",                     "Somme"),
+    ("part_res_principales_2022",  "Part résidences principales (%)",       "Moy. pond."),
+    ("part_res_secondaires_2022",  "Part résidences secondaires (%)",       "Moy. pond."),
+    ("part_logements_vacants_2022","Part logements vacants (%)",            "Moy. pond."),
+    ("part_proprietaires_2022",    "Part ménages propriétaires (%)",        "Moy. pond."),
+    # Revenus
+    ("mediane_revenu_2021",        "Niveau de vie médian (€)",              "Moy. pond."),
+    ("taux_pauvrete_2021",         "Taux de pauvreté (%)",                  "Moy. pond."),
+    ("nb_menages_fiscaux_2021",    "Nb ménages fiscaux",                    "Somme"),
+    ("part_menages_imposes_2021",  "Part ménages imposés (%)",              "Moy. pond."),
+    # Emploi
+    ("emploi_total_2022",          "Emploi total 2022",                     "Somme"),
+    ("part_emploi_salarie_2022",   "Part emploi salarié (%)",               "Moy. pond."),
+    ("var_emploi_2016_2022",       "Variation emploi 2016-2022 (%)",        "Moy. pond."),
+    ("taux_activite_15_64_2022",   "Taux d'activité 15-64 ans (%)",         "Moy. pond."),
+    ("taux_chomage_15_64_2022",    "Taux de chômage 15-64 ans (%)",         "Moy. pond."),
+    # Établissements
+    ("nb_etab_actifs_2023",        "Nb établissements actifs",              "Somme"),
+    ("part_agriculture_2023",      "Part agriculture (%)",                  "Moy. pond."),
+    ("part_industrie_2023",        "Part industrie (%)",                    "Moy. pond."),
+    ("part_construction_2023",     "Part construction (%)",                 "Moy. pond."),
+    ("part_commerce_transp_2023",  "Part commerce/transports/services (%)", "Moy. pond."),
+    ("part_admin_sante_2023",      "Part admin. publique/santé (%)",        "Moy. pond."),
+    ("part_etab_1_9_sal_2023",     "Part étab. 1-9 salariés (%)",           "Moy. pond."),
+    ("part_etab_10_sal_plus_2023", "Part étab. 10+ salariés (%)",           "Moy. pond."),
+]
+
+
+def _build_insee_pivot(insee_data: list[dict], all_communes: list[dict] | None = None):
+    """
+    Construit un DataFrame pivoté stylé :
+    - lignes = indicateurs
+    - colonnes = INDICATEUR | commune1 | commune2 | … | TOTAL ZONE | Calcul
+    - cellules vides (commune sans données INSEE) en jaune
+    """
+    def _v(val):
+        return "" if val is None else val
+
+    # Index insee_data par nom de commune
+    insee_by_nom = {r.get("commune", r.get("code_insee", "?")): r for r in insee_data}
+
+    # Communes sans données INSEE → colonne jaune
+    # Critère : statut "Code INSEE manquant" / "Données non trouvées", ou aucune valeur numérique
+    _statuts_vides = {"Code INSEE manquant", "Données non trouvées"}
+    communes_sans_donnees: set[str] = {
+        r.get("commune", r.get("code_insee", "?"))
+        for r in insee_data
+        if r.get("_statut") in _statuts_vides
+    }
+
+    # Liste complète des communes à afficher
+    if all_communes:
+        all_noms = []
+        seen = set()
+        for c in all_communes:
+            nom = c.get("nom", c.get("code_insee", "?"))
+            if nom not in seen:
+                seen.add(nom)
+                all_noms.append(nom)
+        for nom in insee_by_nom:
+            if nom not in seen:
+                all_noms.append(nom)
+    else:
+        all_noms = list(insee_by_nom.keys())
+
+    totaux = compute_zone_totals(insee_data)
+
+    rows = []
+    for key, label, calcul in _INDICATEURS:
+        row = {"Indicateur": label}
+        for nom in all_noms:
+            r = insee_by_nom.get(nom, {})
+            row[nom] = _v(r.get(key))
+        row["TOTAL ZONE"] = _v(totaux.get(key))
+        row["Calcul"] = calcul
+        rows.append(row)
+
+    cols = ["Indicateur"] + all_noms + ["TOTAL ZONE", "Calcul"]
+    df = pd.DataFrame(rows, columns=cols)
+
+    # Coloration jaune pour les colonnes sans données INSEE
+    def _highlight(df):
+        styles = pd.DataFrame("", index=df.index, columns=df.columns)
+        for nom in communes_sans_donnees:
+            if nom in styles.columns:
+                styles[nom] = "background-color: #FFF59D"
+        return styles
+
+    return df.style.apply(_highlight, axis=None)
 
 
 # ── Header ────────────────────────────────────────────────────────────────────
@@ -145,7 +252,7 @@ if st.session_state.step == 1:
     if cp_uniques:
         st.success(f"**{len(cp_uniques)} code(s) postal/aux**")
         df_cp = pd.DataFrame({"Code postal": cp_uniques})
-        st.dataframe(df_cp, use_container_width=False, hide_index=True, width=200)
+        st.dataframe(df_cp, width='content', hide_index=True)
 
     # Modification manuelle
     with st.expander("✏️ Ajouter / Supprimer des codes postaux"):
@@ -209,7 +316,7 @@ elif st.session_state.step == 2:
     for cp, communes in st.session_state.communes_par_cp.items():
         noms = ", ".join(c["nom"] for c in communes) if communes else "⚠️ Non résolu"
         rows.append({"Code postal": cp, "Commune(s)": noms})
-    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    st.dataframe(pd.DataFrame(rows), width='stretch', hide_index=True)
 
     st.divider()
     col_back, col_next = st.columns([1, 5])
@@ -247,6 +354,8 @@ elif st.session_state.step == 3:
                 c.setdefault("region",      {"code": "",        "nom": region})
                 c.setdefault("cp", cp)
                 communes_flat.append(c)
+
+    st.session_state.communes_flat = communes_flat
 
     communes_pj = [{"nom": c["nom"], "cp": c.get("cp", "")} for c in communes_flat]
 
@@ -290,14 +399,14 @@ elif st.session_state.step == 3:
             "label": "🤱 Sages-femmes",
             "desc":  "Ordre SF — sages-femmes libérales",
             "fn":    get_sages_femmes,
-            "args":  (communes_pj,),
+            "args":  (dept_code, cp_uniques),
         },
         {
             "key":   "pmi",
             "label": "👶 PMI",
             "desc":  "AlloPMI — PMI",
             "fn":    get_pmi,
-            "args":  (dept_code, dept_nom),
+            "args":  (dept_code, dept_nom, cp_uniques, communes_pj),
         },
     ]
 
@@ -352,16 +461,11 @@ elif st.session_state.step == 3:
                                  "Niveau": m.get("type_niveau",""), "Accouchements/an": m.get("nb_accouchements_an",""), "Ville": m.get("ville","")})
             else:
                 rows.append({"CP": cp, "Maternité": "—", "Statut": "", "Niveau": "", "Accouchements/an": "", "Ville": ""})
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(rows), width='stretch', hide_index=True)
 
     elif key == "insee" and isinstance(data, list):
         if data:
-            df = pd.DataFrame([{
-                "Commune": r.get("commune",""), "Population 2022": r.get("pop_2022",""),
-                "Naissances": r.get("naissances_2022",""), "Taux chômage": r.get("taux_chomage_15_64_2022",""),
-                "Médiane revenu": r.get("mediane_revenu_2021",""), "Statut": r.get("_statut","OK"),
-            } for r in data])
-            st.dataframe(df, use_container_width=True, hide_index=True)
+            st.dataframe(_build_insee_pivot(data, st.session_state.get("communes_flat")), width='stretch', hide_index=True)
         else:
             st.warning("Aucune donnée INSEE récupérée.")
 
@@ -369,33 +473,55 @@ elif st.session_state.step == 3:
         if data:
             df = pd.DataFrame([{
                 "Commune": r.get("commune",""), "CP": r.get("cp",""),
-                "Pharmacies": r.get("nb_pharmacies",0), "Matériel médical": r.get("nb_materiel_medical",0),
+                "Pharmacies": r.get("nb_pharmacies",0), "Magasin matériel médical": r.get("nb_materiel_medical",0),
             } for r in data])
-            st.dataframe(df, use_container_width=True, hide_index=True)
+            st.dataframe(df, width='stretch', hide_index=True)
         else:
             st.warning("Aucune donnée Pages Jaunes récupérée.")
 
     elif key == "lactariums" and isinstance(data, list):
         if data:
-            st.dataframe(pd.DataFrame([{"Nom": r.get("nom",""), "Département": r.get("departement",""), "Tél.": r.get("telephone","")} for r in data]),
-                         use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame([{
+                "Nom":         r.get("nom", ""),
+                "CP":          r.get("cp", ""),
+                "Ville":       r.get("ville", ""),
+                "Adresse":     r.get("adresse", ""),
+                "Tél.":        r.get("telephone", ""),
+                "Email":       r.get("email", ""),
+                "Type":        r.get("type", ""),
+                "Don anonyme": r.get("don_anonyme", ""),
+                "Équipe":      " / ".join(r.get("equipe", [])[:3]),
+            } for r in data]), width='stretch', hide_index=True)
         else:
-            st.info("Aucun lactarium sur cette zone.")
+            st.info("Aucun lactarium dans votre zone.")
 
     elif key == "sages_femmes" and isinstance(data, list):
         if data:
-            st.dataframe(pd.DataFrame([{"Nom": f"{r.get('nom','')} {r.get('prenom','')}".strip(),
-                "Adresse": r.get("adresse",""), "Tél.": r.get("telephone",""), "Email": r.get("email","")} for r in data]),
-                         use_container_width=True, hide_index=True)
+            st.metric("Sages-femmes (dédoublonnées)", len(data))
+            st.dataframe(pd.DataFrame([{
+                "Nom":          f"{r.get('nom','')} {r.get('prenom','')}".strip(),
+                "Codes postaux": r.get("code_postaux_display", r.get("cp", "")),
+                "Adresse":      r.get("adresse", ""),
+                "Tél.":         r.get("telephone", ""),
+                "Email":        r.get("email", ""),
+            } for r in data]), width='stretch', hide_index=True)
         else:
             st.warning("Aucune sage-femme trouvée.")
 
     elif key == "pmi" and isinstance(data, list):
         if data:
-            st.dataframe(pd.DataFrame([{"Nom": r.get("nom",""), "Adresse": r.get("adresse",""), "Tél.": r.get("telephone","")} for r in data]),
-                         use_container_width=True, hide_index=True)
+            st.metric("Centres PMI", len(data))
+            st.dataframe(pd.DataFrame([{
+                "Nom":       r.get("nom", ""),
+                "CP":        r.get("cp", ""),
+                "Ville":     r.get("ville", ""),
+                "Adresse":   r.get("adresse", ""),
+                "Téléphone": r.get("telephone", ""),
+                "Email":     r.get("email", ""),
+                "Horaires":  r.get("horaires", ""),
+            } for r in data]), width='stretch', hide_index=True)
         else:
-            st.warning("Aucune PMI trouvée.")
+            st.info("Aucune PMI dans votre zone.")
 
     st.divider()
 
@@ -490,22 +616,22 @@ elif st.session_state.step == 4:
     pmi_data   = results.get("pmi", [])
     lac_data   = results.get("lactariums", [])
 
-    def _sum(key):
-        total = 0
-        for r in insee_data:
-            v = r.get(key)
-            if v is not None:
-                try:
-                    total += float(str(v).replace(",", ".").replace(" ", "").replace(" ", ""))
-                except ValueError:
-                    pass
-        return int(total) if total else "N/D"
+    zone_totals = compute_zone_totals(insee_data) if insee_data else {}
+
+    def _kpi(key):
+        v = zone_totals.get(key)
+        if v is None:
+            return "N/D"
+        try:
+            n = int(float(str(v).replace(",", ".")))
+            return f"{n:,}".replace(",", " ")
+        except Exception:
+            return str(v)
 
     # KPIs
     col1, col2, col3, col4, col5 = st.columns(5)
-    pop = _sum("pop_2022")
-    col1.metric("Population 2022", f"{pop:,}".replace(",", " ") if isinstance(pop, int) else "N/D")
-    col2.metric("Naissances 2022", _sum("naissances_2022"))
+    col1.metric("Population 2022", _kpi("pop_2022"))
+    col2.metric("Naissances 2022", _kpi("naissances_2022"))
     col3.metric("Pharmacies", sum(r.get("nb_pharmacies", 0) for r in pj_data))
     col4.metric("Sages-femmes", len(sf_data))
     col5.metric("PMI", len([p for p in pmi_data if "Erreur" not in p.get("nom", "")]))
@@ -518,28 +644,33 @@ elif st.session_state.step == 4:
 
     with tab1:
         if insee_data:
-            df = pd.DataFrame([{
-                "Commune":             r.get("commune", ""),
-                "Population 2022":     r.get("pop_2022", ""),
-                "Naissances 2022":     r.get("naissances_2022", ""),
-                "Taux chômage (%)":    r.get("taux_chomage_15_64_2022", ""),
-                "Médiane revenu (€)":  r.get("mediane_revenu_2021", ""),
-                "Statut":              r.get("_statut", "OK"),
-            } for r in insee_data])
-            st.dataframe(df, use_container_width=True, hide_index=True)
+            st.dataframe(_build_insee_pivot(insee_data, st.session_state.get("communes_flat")), width='stretch', hide_index=True)
         else:
             st.warning("Données INSEE non récupérées — le site a peut-être bloqué la requête. Relancez la collecte.")
 
     with tab2:
         if pj_data:
             df = pd.DataFrame([{
-                "Commune":          r.get("commune", ""),
-                "CP":               r.get("cp", ""),
-                "Pharmacies":       r.get("nb_pharmacies", 0),
-                "Matériel médical": r.get("nb_materiel_medical", 0),
-                "Noms pharmacies":  ", ".join(r.get("noms_pharmacies", [])[:5]),
+                "Commune":                    r.get("commune", ""),
+                "CP":                         r.get("cp", ""),
+                "Pharmacies":                 r.get("nb_pharmacies", 0),
+                "Noms pharmacies":            "\n".join(
+                    f"{n} — {a}" if a else n
+                    for n, a in zip(
+                        r.get("noms_pharmacies", [])[:5],
+                        r.get("adresses_pharmacies", [])[:5] + [""] * 5
+                    )
+                ),
+                "Magasin matériel médical":   r.get("nb_materiel_medical", 0),
+                "Noms matériel médical":      "\n".join(
+                    f"{n} — {a}" if a else n
+                    for n, a in zip(
+                        r.get("noms_materiel_medical", [])[:5],
+                        r.get("adresses_materiel_medical", [])[:5] + [""] * 5
+                    )
+                ),
             } for r in pj_data])
-            st.dataframe(df, use_container_width=True, hide_index=True)
+            st.dataframe(df, width='stretch', hide_index=True)
         else:
             st.warning("Données Pages Jaunes non récupérées.")
 
@@ -563,7 +694,7 @@ elif st.session_state.step == 4:
                                      "Accouchements/an": "", "Ville": "", "Lien": ""})
         if rows_mat:
             df_mat = pd.DataFrame(rows_mat)
-            st.dataframe(df_mat, use_container_width=True, hide_index=True)
+            st.dataframe(df_mat, width='stretch', hide_index=True)
         else:
             st.warning("Aucune maternité trouvée.")
 
@@ -576,7 +707,7 @@ elif st.session_state.step == 4:
                 "Email":     r.get("email", ""),
                 "Commune":   r.get("commune", ""),
             } for r in sf_data])
-            st.dataframe(df, use_container_width=True, hide_index=True)
+            st.dataframe(df, width='stretch', hide_index=True)
         else:
             st.warning("Aucune sage-femme trouvée.")
 
@@ -587,7 +718,7 @@ elif st.session_state.step == 4:
                 "Département": r.get("departement", ""),
                 "Téléphone":   r.get("telephone", ""),
             } for r in lac_data])
-            st.dataframe(df, use_container_width=True, hide_index=True)
+            st.dataframe(df, width='stretch', hide_index=True)
         else:
             st.warning("Aucun lactarium trouvé.")
 
@@ -595,11 +726,13 @@ elif st.session_state.step == 4:
         if pmi_data:
             df = pd.DataFrame([{
                 "Nom":       r.get("nom", ""),
+                "CP":        r.get("cp", ""),
+                "Ville":     r.get("ville", ""),
                 "Adresse":   r.get("adresse", ""),
                 "Téléphone": r.get("telephone", ""),
-                "Commune":   r.get("commune", ""),
+                "Email":     r.get("email", ""),
             } for r in pmi_data])
-            st.dataframe(df, use_container_width=True, hide_index=True)
+            st.dataframe(df, width='stretch', hide_index=True)
         else:
             st.warning("Aucune PMI trouvée.")
 
