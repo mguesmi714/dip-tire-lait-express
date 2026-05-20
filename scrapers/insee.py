@@ -97,14 +97,13 @@ def _scrape_batch(cog_codes: list[str]) -> dict[str, dict]:
 
     results: dict[str, dict] = {cog: {} for cog in cog_codes}
 
-    with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=True)
-        page = browser.new_page(
-            locale="fr-FR",
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36"
-        )
-
-        try:
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=True)
+            page = browser.new_page(
+                locale="fr-FR",
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36"
+            )
             page.goto(url, wait_until="networkidle", timeout=40000)
             time.sleep(3)
 
@@ -151,10 +150,10 @@ def _scrape_batch(cog_codes: list[str]) -> dict[str, dict]:
                             if cog in results:
                                 results[cog][key] = val
 
-        except Exception as e:
-            print(f"[INSEE] Erreur scraping : {e}")
-        finally:
             browser.close()
+
+    except Exception as e:
+        print(f"[INSEE] Erreur scraping : {e}")
 
     return results
 
