@@ -332,11 +332,23 @@ elif st.session_state.step == 2:
     st.divider()
     st.write("**Communes associées à chaque code postal :**")
 
-    rows = []
+    rows_communes = []
     for cp, communes in st.session_state.communes_par_cp.items():
-        noms = ", ".join(c["nom"] for c in communes) if communes else "⚠️ Non résolu"
-        rows.append({"Code postal": cp, "Commune(s)": noms})
-    st.dataframe(pd.DataFrame(rows), width='stretch', hide_index=True)
+        if communes:
+            for c in communes:
+                rows_communes.append({
+                    "Code postal": cp,
+                    "Commune":     c["nom"],
+                    "Code INSEE":  c.get("code_insee", ""),
+                    "Département": c.get("departement", {}).get("nom", "") if isinstance(c.get("departement"), dict) else "",
+                    "Région":      c.get("region", {}).get("nom", "") if isinstance(c.get("region"), dict) else "",
+                })
+        else:
+            rows_communes.append({"Code postal": cp, "Commune": "⚠️ Non résolu", "Code INSEE": "", "Département": "", "Région": ""})
+
+    df_communes = pd.DataFrame(rows_communes)
+    st.dataframe(df_communes, width='stretch', hide_index=True)
+    _dl_button(df_communes, "Communes", "communes")
 
     st.divider()
     col_back, col_next = st.columns([1, 5])
