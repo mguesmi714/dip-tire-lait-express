@@ -4,8 +4,10 @@ Lancer : streamlit run app.py
 """
 
 import io
+import os
 import re
 import sys
+import subprocess
 import concurrent.futures
 from pathlib import Path
 from datetime import date
@@ -15,6 +17,24 @@ import streamlit as st
 import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).parent))
+
+
+@st.cache_resource
+def _install_playwright_chromium():
+    """Installe Chromium pour Playwright une seule fois par session cloud."""
+    flag = "/tmp/.playwright_installed"
+    if not os.path.exists(flag):
+        try:
+            subprocess.run(
+                [sys.executable, "-m", "playwright", "install", "chromium"],
+                check=True, capture_output=True,
+            )
+            open(flag, "w").write("ok")
+        except subprocess.CalledProcessError as e:
+            st.warning(f"Playwright install : {e.stderr.decode() if e.stderr else e}")
+    return True
+
+_install_playwright_chromium()
 
 from scrapers.communes import get_communes_for_all_cp
 from scrapers.insee import get_all_communes_data, compute_zone_totals

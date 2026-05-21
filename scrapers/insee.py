@@ -228,7 +228,17 @@ def _scrape_batch(communes_batch: list[dict]) -> dict[str, dict]:
             browser.close()
 
     except Exception as e:
-        print(f"[INSEE] Erreur scraping : {e}")
+        import traceback
+        err_msg = f"[INSEE] Erreur scraping : {type(e).__name__}: {e}"
+        print(err_msg)
+        print(traceback.format_exc())
+        try:
+            import streamlit as st
+            st.error(err_msg)
+            with st.expander("Détails techniques INSEE"):
+                st.code(traceback.format_exc())
+        except Exception:
+            pass
 
     return results
 
