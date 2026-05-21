@@ -22,14 +22,15 @@ sys.path.insert(0, str(Path(__file__).parent))
 @st.cache_resource
 def _install_playwright_chromium():
     """Installe Chromium pour Playwright une seule fois par session cloud."""
-    flag = "/tmp/.playwright_installed"
-    if not os.path.exists(flag):
+    import tempfile
+    flag = Path(tempfile.gettempdir()) / ".playwright_installed"
+    if not flag.exists():
         try:
             subprocess.run(
                 [sys.executable, "-m", "playwright", "install", "chromium"],
                 check=True, capture_output=True,
             )
-            open(flag, "w").write("ok")
+            flag.write_text("ok")
         except subprocess.CalledProcessError as e:
             st.warning(f"Playwright install : {e.stderr.decode() if e.stderr else e}")
     return True
