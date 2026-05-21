@@ -115,12 +115,15 @@ def _load_dept_page(dept_code: str) -> dict[str, list[str]]:
 
 
 def _normalize(name: str) -> str:
-    """Normalise un nom pour la comparaison (minuscule, sans accents)."""
+    """Normalise un nom pour la comparaison (minuscule, sans accents, sans tirets/apostrophes)."""
     name = name.lower().strip()
-    return "".join(
+    name = "".join(
         c for c in unicodedata.normalize("NFD", name)
         if unicodedata.category(c) != "Mn"
     )
+    # Unifier tirets, apostrophes et espaces → espace simple
+    name = re.sub(r"[-'\s]+", " ", name).strip()
+    return name
 
 
 def get_communes_for_cp(cp: str) -> list[dict]:
@@ -134,7 +137,7 @@ def get_communes_for_cp(cp: str) -> list[dict]:
     dept_data = _load_dept_page(dept_code)
     noms_annuaire: list[str] = dept_data.get(cp, [])
 
-    # 2. Données INSEE depuis geo.api.gouv.fr
+    # 2. Données INSEE depuis geo.api.gouv.fr (par code postal)
     geo_data: list[dict] = []
     try:
         r = requests.get(_GEO_CP.format(cp=cp), timeout=10)
@@ -142,6 +145,22 @@ def get_communes_for_cp(cp: str) -> list[dict]:
             geo_data = r.json()
     except Exception:
         pass
+
+    # 2b. Si aucun résultat par CP, tenter comme code INSEE direct
+    # (l'email peut contenir des codes COG comme 57117 au lieu du CP 57130)
+    if not geo_data:
+        try:
+            r2 = requests.get(
+                f"https://geo.api.gouv.fr/communes/{cp}?fields=nom,code,departement,region",
+                timeout=10
+            )
+            if r2.status_code == 200:
+                c = r2.json()
+                if c.get("code"):
+                    geo_data = [c]
+                    print(f"[COMMUNES] {cp} résolu comme code INSEE → {c.get('nom')}")
+        except Exception:
+            pass
 
     # Index geo par nom normalisé → pour retrouver le code INSEE
     geo_by_norm: dict[str, dict] = {
@@ -156,7 +175,15 @@ def get_communes_for_cp(cp: str) -> list[dict]:
     for nom in noms_annuaire:
         norm = _normalize(nom)
         geo  = geo_by_norm.get(norm)
-        code_insee = geo.get("code", "") if geo else ""
+
+        # Fallback : si pas de correspondance exacte, chercher par inclusion de mots
+        if not geo:
+            for geo_norm, geo_c in geo_by_norm.items():
+                if norm in geo_norm or geo_norm in norm:
+                    geo = geo_c
+                    break
+
+        code_insee  = geo.get("code", "") if geo else ""
         departement = geo.get("departement", {}) if geo else {"code": dept_code, "nom": ""}
         region      = geo.get("region", {})       if geo else {}
         if geo:
@@ -169,6 +196,14 @@ def get_communes_for_cp(cp: str) -> list[dict]:
             "departement": departement,
             "region":      region,
         })
+
+    # 3b. Communes de l'annuaire sans code INSEE → récupérer les codes geo restants
+    unmatched_geo = [c for c in geo_data if c.get("code", "") not in matched_geo_codes]
+    sans_code = [c for c in communes if not c.get("code_insee")]
+    for comm, geo_c in zip(sans_code, unmatched_geo):
+        comm["code_insee"]  = geo_c.get("code", "")
+        comm["departement"] = geo_c.get("departement", comm["departement"])
+        comm["region"]      = geo_c.get("region", comm["region"])
 
     # 4. Si annuaire vide → utiliser geo.api.gouv.fr seul (fallback)
     if not communes and geo_data:

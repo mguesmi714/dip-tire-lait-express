@@ -1,5 +1,5 @@
 """
-Génère le fichier Excel structuré avec 6 onglets.
+Génère le fichier Excel structuré avec 11 onglets.
 Chaque onglet a une ligne par commune + une ligne TOTAL/MOYENNE pondérée.
 """
 
@@ -32,6 +32,8 @@ def _write_header(ws, columns: list[str]) -> None:
         cell.alignment = _CENTER
         cell.border = _THIN_BORDER
     ws.row_dimensions[1].height = 40
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = f"A1:{get_column_letter(len(columns))}1"
 
 
 def _style_row(ws, row_idx: int, is_total: bool = False) -> None:
@@ -47,14 +49,14 @@ def _style_row(ws, row_idx: int, is_total: bool = False) -> None:
 def _autofit(ws) -> None:
     for col in ws.columns:
         max_len = max((len(str(c.value or "")) for c in col), default=10)
-        ws.column_dimensions[get_column_letter(col[0].column)].width = min(max_len + 2, 30)
+        ws.column_dimensions[get_column_letter(col[0].column)].width = min(max_len + 2, 40)
 
 
 def _safe_float(v) -> float | None:
     if v is None or v == "":
         return None
     try:
-        return float(str(v).replace(",", ".").replace(" ", "").replace(" ", ""))
+        return float(str(v).replace(",", ".").replace(" ", "").replace("\xa0", ""))
     except ValueError:
         return None
 
@@ -79,43 +81,52 @@ def _weighted_avg(rows: list[dict], key: str, weight_key: str = "pop_2022") -> s
     return str(round(total_v / total_w, 1))
 
 
-# ── Onglets ────────────────────────────────────────────────────────────────────
+def _sort_communes(data: list[dict]) -> list[dict]:
+    """Trie les communes par CP puis par nom (les lignes TOTAL restent à la fin)."""
+    return sorted(
+        [r for r in data if r.get("commune") != "TOTAL ZONE"],
+        key=lambda r: (str(r.get("cp", "")), str(r.get("commune", "")).lower()),
+    )
+
+
+# ── Onglets INSEE ─────────────────────────────────────────────────────────────
 
 def _onglet_geo(wb, communes_data: list[dict]) -> None:
     ws = wb.create_sheet("Geo")
     cols = [
-        "Commune", "Code INSEE", "Département", "Région",
-        "Population 2022", "Superficie (km²)", "Densité (hab/km²) 2022",
+        "Commune", "Code INSEE", "CP", "Département", "Région",
+        "Population 2022", "Superficie (km²)", "Densité (hab/km²)",
         "Variation pop. 2016-2022 (%)", "Solde naturel (%)", "Solde migratoire (%)",
-        "Nb ménages 2022", "Naissances 2022", "Décès 2022", "Source", "Statut",
+        "Nb ménages 2022", "Naissances 2022", "Décès 2022", "Statut",
     ]
     _write_header(ws, cols)
 
-    for row_idx, r in enumerate(communes_data, 2):
+    sorted_data = _sort_communes(communes_data)
+    for row_idx, r in enumerate(sorted_data, 2):
         ws.append([
-            r.get("commune", ""), r.get("code_insee", ""),
+            r.get("commune", ""), r.get("code_insee", ""), r.get("cp", ""),
             r.get("departement", ""), r.get("region", ""),
             r.get("pop_2022", ""), r.get("superficie_km2", ""),
             r.get("densite_2022", ""), r.get("var_pop_2016_2022", ""),
             r.get("solde_naturel", ""), r.get("solde_migratoire", ""),
             r.get("nb_menages_2022", ""), r.get("naissances_2022", ""),
-            r.get("deces_2022", ""), r.get("_source", ""), r.get("_statut", ""),
+            r.get("deces_2022", ""), r.get("_statut", ""),
         ])
         _style_row(ws, row_idx)
 
-    # Ligne TOTAL
-    total_row = ["TOTAL ZONE", "", "", "",
-                 _sum_col(communes_data, "pop_2022"),
-                 _sum_col(communes_data, "superficie_km2"),
-                 _weighted_avg(communes_data, "densite_2022"),
-                 _weighted_avg(communes_data, "var_pop_2016_2022"),
-                 _weighted_avg(communes_data, "solde_naturel"),
-                 _weighted_avg(communes_data, "solde_migratoire"),
-                 _sum_col(communes_data, "nb_menages_2022"),
-                 _sum_col(communes_data, "naissances_2022"),
-                 _sum_col(communes_data, "deces_2022"),
-                 "Calculé", ""]
-    ws.append(total_row)
+    ws.append([
+        "TOTAL ZONE", "", "", "", "",
+        _sum_col(sorted_data, "pop_2022"),
+        _sum_col(sorted_data, "superficie_km2"),
+        _weighted_avg(sorted_data, "densite_2022"),
+        _weighted_avg(sorted_data, "var_pop_2016_2022"),
+        _weighted_avg(sorted_data, "solde_naturel"),
+        _weighted_avg(sorted_data, "solde_migratoire"),
+        _sum_col(sorted_data, "nb_menages_2022"),
+        _sum_col(sorted_data, "naissances_2022"),
+        _sum_col(sorted_data, "deces_2022"),
+        "Calculé",
+    ])
     _style_row(ws, ws.max_row, is_total=True)
     _autofit(ws)
 
@@ -123,15 +134,17 @@ def _onglet_geo(wb, communes_data: list[dict]) -> None:
 def _onglet_logement(wb, communes_data: list[dict]) -> None:
     ws = wb.create_sheet("Logement")
     cols = [
-        "Commune", "Nb logements 2022",
+        "Commune", "CP",
+        "Nb logements 2022",
         "Résidences principales (%)", "Résidences secondaires (%)",
         "Logements vacants (%)", "Ménages propriétaires (%)",
     ]
     _write_header(ws, cols)
 
-    for row_idx, r in enumerate(communes_data, 2):
+    sorted_data = _sort_communes(communes_data)
+    for row_idx, r in enumerate(sorted_data, 2):
         ws.append([
-            r.get("commune", ""),
+            r.get("commune", ""), r.get("cp", ""),
             r.get("nb_logements_2022", ""),
             r.get("part_res_principales_2022", ""),
             r.get("part_res_secondaires_2022", ""),
@@ -141,12 +154,12 @@ def _onglet_logement(wb, communes_data: list[dict]) -> None:
         _style_row(ws, row_idx)
 
     ws.append([
-        "TOTAL / MOY. PONDÉRÉE",
-        _sum_col(communes_data, "nb_logements_2022"),
-        _weighted_avg(communes_data, "part_res_principales_2022"),
-        _weighted_avg(communes_data, "part_res_secondaires_2022"),
-        _weighted_avg(communes_data, "part_logements_vacants_2022"),
-        _weighted_avg(communes_data, "part_proprietaires_2022"),
+        "TOTAL / MOY. PONDÉRÉE", "",
+        _sum_col(sorted_data, "nb_logements_2022"),
+        _weighted_avg(sorted_data, "part_res_principales_2022"),
+        _weighted_avg(sorted_data, "part_res_secondaires_2022"),
+        _weighted_avg(sorted_data, "part_logements_vacants_2022"),
+        _weighted_avg(sorted_data, "part_proprietaires_2022"),
     ])
     _style_row(ws, ws.max_row, is_total=True)
     _autofit(ws)
@@ -155,15 +168,16 @@ def _onglet_logement(wb, communes_data: list[dict]) -> None:
 def _onglet_revenus(wb, communes_data: list[dict]) -> None:
     ws = wb.create_sheet("Revenus")
     cols = [
-        "Commune",
+        "Commune", "CP",
         "Nb ménages fiscaux 2021", "Ménages imposés 2021 (%)",
-        "Médiane revenu disponible 2021 (€)", "Taux de pauvreté 2021 (%)",
+        "Médiane revenu disponible (€)", "Taux de pauvreté (%)",
     ]
     _write_header(ws, cols)
 
-    for row_idx, r in enumerate(communes_data, 2):
+    sorted_data = _sort_communes(communes_data)
+    for row_idx, r in enumerate(sorted_data, 2):
         ws.append([
-            r.get("commune", ""),
+            r.get("commune", ""), r.get("cp", ""),
             r.get("nb_menages_fiscaux_2021", ""),
             r.get("part_menages_imposes_2021", ""),
             r.get("mediane_revenu_2021", ""),
@@ -172,11 +186,11 @@ def _onglet_revenus(wb, communes_data: list[dict]) -> None:
         _style_row(ws, row_idx)
 
     ws.append([
-        "TOTAL / MOY. PONDÉRÉE",
-        _sum_col(communes_data, "nb_menages_fiscaux_2021"),
-        _weighted_avg(communes_data, "part_menages_imposes_2021"),
-        _weighted_avg(communes_data, "mediane_revenu_2021"),
-        _weighted_avg(communes_data, "taux_pauvrete_2021"),
+        "TOTAL / MOY. PONDÉRÉE", "",
+        _sum_col(sorted_data, "nb_menages_fiscaux_2021"),
+        _weighted_avg(sorted_data, "part_menages_imposes_2021"),
+        _weighted_avg(sorted_data, "mediane_revenu_2021"),
+        _weighted_avg(sorted_data, "taux_pauvrete_2021"),
     ])
     _style_row(ws, ws.max_row, is_total=True)
     _autofit(ws)
@@ -185,17 +199,18 @@ def _onglet_revenus(wb, communes_data: list[dict]) -> None:
 def _onglet_emploi(wb, communes_data: list[dict]) -> None:
     ws = wb.create_sheet("Emploi")
     cols = [
-        "Commune",
-        "Emploi total 2022", "Part emploi salarié 2022 (%)",
+        "Commune", "CP",
+        "Emploi total 2022", "Part emploi salarié (%)",
         "Variation emploi 2016-2022 (%)",
-        "Taux d'activité 15-64 ans 2022 (%)",
-        "Taux de chômage 15-64 ans 2022 (%)",
+        "Taux d'activité 15-64 ans (%)",
+        "Taux de chômage 15-64 ans (%)",
     ]
     _write_header(ws, cols)
 
-    for row_idx, r in enumerate(communes_data, 2):
+    sorted_data = _sort_communes(communes_data)
+    for row_idx, r in enumerate(sorted_data, 2):
         ws.append([
-            r.get("commune", ""),
+            r.get("commune", ""), r.get("cp", ""),
             r.get("emploi_total_2022", ""),
             r.get("part_emploi_salarie_2022", ""),
             r.get("var_emploi_2016_2022", ""),
@@ -205,12 +220,12 @@ def _onglet_emploi(wb, communes_data: list[dict]) -> None:
         _style_row(ws, row_idx)
 
     ws.append([
-        "TOTAL / MOY. PONDÉRÉE",
-        _sum_col(communes_data, "emploi_total_2022"),
-        _weighted_avg(communes_data, "part_emploi_salarie_2022"),
-        _weighted_avg(communes_data, "var_emploi_2016_2022"),
-        _weighted_avg(communes_data, "taux_activite_15_64_2022"),
-        _weighted_avg(communes_data, "taux_chomage_15_64_2022"),
+        "TOTAL / MOY. PONDÉRÉE", "",
+        _sum_col(sorted_data, "emploi_total_2022"),
+        _weighted_avg(sorted_data, "part_emploi_salarie_2022"),
+        _weighted_avg(sorted_data, "var_emploi_2016_2022"),
+        _weighted_avg(sorted_data, "taux_activite_15_64_2022"),
+        _weighted_avg(sorted_data, "taux_chomage_15_64_2022"),
     ])
     _style_row(ws, ws.max_row, is_total=True)
     _autofit(ws)
@@ -219,17 +234,18 @@ def _onglet_emploi(wb, communes_data: list[dict]) -> None:
 def _onglet_etablissements(wb, communes_data: list[dict]) -> None:
     ws = wb.create_sheet("Etablissements")
     cols = [
-        "Commune",
+        "Commune", "CP",
         "Nb établissements actifs fin 2023",
         "Agriculture (%)", "Industrie (%)", "Construction (%)",
-        "Commerce/Transp./Services (%)", "Admin./Santé/Action soc. (%)",
+        "Commerce / Transp. / Services (%)", "Admin. / Santé (%)",
         "1 à 9 salariés (%)", "10 salariés ou + (%)",
     ]
     _write_header(ws, cols)
 
-    for row_idx, r in enumerate(communes_data, 2):
+    sorted_data = _sort_communes(communes_data)
+    for row_idx, r in enumerate(sorted_data, 2):
         ws.append([
-            r.get("commune", ""),
+            r.get("commune", ""), r.get("cp", ""),
             r.get("nb_etab_actifs_2023", ""),
             r.get("part_agriculture_2023", ""),
             r.get("part_industrie_2023", ""),
@@ -242,17 +258,136 @@ def _onglet_etablissements(wb, communes_data: list[dict]) -> None:
         _style_row(ws, row_idx)
 
     ws.append([
-        "TOTAL / MOY. PONDÉRÉE",
-        _sum_col(communes_data, "nb_etab_actifs_2023"),
-        _weighted_avg(communes_data, "part_agriculture_2023"),
-        _weighted_avg(communes_data, "part_industrie_2023"),
-        _weighted_avg(communes_data, "part_construction_2023"),
-        _weighted_avg(communes_data, "part_commerce_transp_2023"),
-        _weighted_avg(communes_data, "part_admin_sante_2023"),
-        _weighted_avg(communes_data, "part_etab_1_9_sal_2023"),
-        _weighted_avg(communes_data, "part_etab_10_sal_plus_2023"),
+        "TOTAL / MOY. PONDÉRÉE", "",
+        _sum_col(sorted_data, "nb_etab_actifs_2023"),
+        _weighted_avg(sorted_data, "part_agriculture_2023"),
+        _weighted_avg(sorted_data, "part_industrie_2023"),
+        _weighted_avg(sorted_data, "part_construction_2023"),
+        _weighted_avg(sorted_data, "part_commerce_transp_2023"),
+        _weighted_avg(sorted_data, "part_admin_sante_2023"),
+        _weighted_avg(sorted_data, "part_etab_1_9_sal_2023"),
+        _weighted_avg(sorted_data, "part_etab_10_sal_plus_2023"),
     ])
     _style_row(ws, ws.max_row, is_total=True)
+    _autofit(ws)
+
+
+# ── Onglets autres sources ────────────────────────────────────────────────────
+
+def _onglet_pharmacies_mm(wb, pj_data: list[dict]) -> None:
+    ws = wb.create_sheet("Pharmacies_MM")
+    cols = [
+        "Commune", "CP",
+        "Nb pharmacies", "Noms pharmacies",
+        "Nb magasins mat. médical", "Noms magasins mat. médical",
+    ]
+    _write_header(ws, cols)
+
+    sorted_data = sorted(pj_data, key=lambda r: (str(r.get("cp", "")), str(r.get("commune", "")).lower()))
+    for row_idx, r in enumerate(sorted_data, 2):
+        ws.append([
+            r.get("commune", ""),
+            r.get("cp", ""),
+            r.get("nb_pharmacies", 0),
+            " | ".join(r.get("noms_pharmacies", [])),
+            r.get("nb_materiel_medical", 0),
+            " | ".join(r.get("noms_materiel_medical", [])),
+        ])
+        _style_row(ws, row_idx)
+
+    if sorted_data:
+        ws.append([
+            "TOTAL", "",
+            sum(r.get("nb_pharmacies", 0) for r in sorted_data),
+            "",
+            sum(r.get("nb_materiel_medical", 0) for r in sorted_data),
+            "",
+        ])
+        _style_row(ws, ws.max_row, is_total=True)
+    _autofit(ws)
+
+
+def _onglet_maternites(wb, maternites: list[dict]) -> None:
+    ws = wb.create_sheet("Maternites")
+    cols = ["Nom", "Ville", "CP", "Statut", "Niveau / Type", "Accouchements/an", "URL source"]
+    _write_header(ws, cols)
+
+    sorted_data = sorted(
+        maternites,
+        key=lambda r: (str(r.get("_cp_recherche", r.get("cp", ""))), str(r.get("nom", "")).lower()),
+    )
+    for row_idx, r in enumerate(sorted_data, 2):
+        ws.append([
+            r.get("nom", ""),
+            r.get("ville", ""),
+            r.get("_cp_recherche", r.get("cp", "")),
+            r.get("statut", ""),
+            r.get("type_niveau", ""),
+            r.get("nb_accouchements_an", ""),
+            r.get("url_source", ""),
+        ])
+        _style_row(ws, row_idx)
+    _autofit(ws)
+
+
+def _onglet_sages_femmes(wb, sages_femmes: list[dict]) -> None:
+    ws = wb.create_sheet("Sages_Femmes")
+    cols = ["Nom", "Prénom", "Codes postaux", "Commune", "Adresse", "Téléphone", "Email"]
+    _write_header(ws, cols)
+
+    sorted_data = sorted(sages_femmes, key=lambda r: (str(r.get("nom", "")), str(r.get("prenom", ""))))
+    for row_idx, r in enumerate(sorted_data, 2):
+        ws.append([
+            r.get("nom", ""),
+            r.get("prenom", ""),
+            r.get("code_postaux_display", r.get("cp", "")),
+            r.get("commune", ""),
+            r.get("adresse", ""),
+            r.get("telephone", ""),
+            r.get("email", ""),
+        ])
+        _style_row(ws, row_idx)
+    _autofit(ws)
+
+
+def _onglet_lactariums(wb, lactariums: list[dict]) -> None:
+    ws = wb.create_sheet("Lactariums")
+    cols = ["Nom", "CP", "Ville", "Adresse", "Téléphone", "Email", "Type", "Don anonyme"]
+    _write_header(ws, cols)
+
+    sorted_data = sorted(lactariums, key=lambda r: (str(r.get("cp", "")), str(r.get("nom", "")).lower()))
+    for row_idx, r in enumerate(sorted_data, 2):
+        ws.append([
+            r.get("nom", ""),
+            r.get("cp", ""),
+            r.get("ville", ""),
+            r.get("adresse", ""),
+            r.get("telephone", ""),
+            r.get("email", ""),
+            r.get("type", ""),
+            r.get("don_anonyme", ""),
+        ])
+        _style_row(ws, row_idx)
+    _autofit(ws)
+
+
+def _onglet_pmi(wb, pmi: list[dict]) -> None:
+    ws = wb.create_sheet("PMI")
+    cols = ["Nom", "CP", "Ville", "Adresse", "Téléphone", "Email", "Horaires"]
+    _write_header(ws, cols)
+
+    sorted_data = sorted(pmi, key=lambda r: (str(r.get("cp", "")), str(r.get("nom", "")).lower()))
+    for row_idx, r in enumerate(sorted_data, 2):
+        ws.append([
+            r.get("nom", ""),
+            r.get("cp", ""),
+            r.get("ville", ""),
+            r.get("adresse", ""),
+            r.get("telephone", ""),
+            r.get("email", ""),
+            r.get("horaires", ""),
+        ])
+        _style_row(ws, row_idx)
     _autofit(ws)
 
 
@@ -262,11 +397,9 @@ def _onglet_synthese(wb, communes_data: list[dict], pj_data: list[dict],
                      zone_nom: str, dept_code: str, dept_nom: str, region: str) -> None:
     ws = wb.create_sheet("Synthese_Zone")
 
-    # Calcul des totaux/moyennes pondérées via insee.py
     t = compute_zone_totals(communes_data)
 
     def _v(key):
-        """Retourne la valeur agrégée ou 'N/D'."""
         val = t.get(key)
         return val if val is not None else "N/D"
 
@@ -275,7 +408,7 @@ def _onglet_synthese(wb, communes_data: list[dict], pj_data: list[dict],
         ["Zone", zone_nom, "", "Saisie"],
         ["Département", f"{dept_nom} ({dept_code})", "", "Saisie"],
         ["Région", region, "", "Saisie"],
-        ["Nb communes", len(communes_data), "Comptage", "Calculé"],
+        ["Nb communes", len([r for r in communes_data if r.get("commune") != "TOTAL ZONE"]), "Comptage", "Calculé"],
         # ── Population ──────────────────────────────────────────────────────
         ["Population totale 2022",              _v("pop_2022"),             "Somme",               "INSEE RP 2022"],
         ["Superficie totale (km²)",             _v("superficie_km2"),       "Somme",               "INSEE RP 2022"],
@@ -323,17 +456,18 @@ def _onglet_synthese(wb, communes_data: list[dict], pj_data: list[dict],
 
     for row_idx, row in enumerate(rows, 1):
         ws.append(row)
-        cell = ws.cell(row_idx, 1)
-        cell.border = _THIN_BORDER
-        ws.cell(row_idx, 2).border = _THIN_BORDER
-        ws.cell(row_idx, 3).border = _THIN_BORDER
+        for col in range(1, 5):
+            cell = ws.cell(row_idx, col)
+            cell.border = _THIN_BORDER
+            cell.alignment = _LEFT
         if row_idx == 1:
-            for col in range(1, 4):
+            for col in range(1, 5):
                 c = ws.cell(row_idx, col)
                 c.font = _HEADER_FONT
                 c.fill = _HEADER_FILL
                 c.alignment = _CENTER
 
+    ws.freeze_panes = "A2"
     _autofit(ws)
 
 
@@ -352,15 +486,23 @@ def generate_excel(
     sages_femmes: list[dict],
     pmi: list[dict],
 ) -> None:
-    """Génère le fichier Excel avec 6 onglets."""
+    """Génère le fichier Excel avec 11 onglets."""
     wb = openpyxl.Workbook()
-    wb.remove(wb.active)  # supprimer la feuille vide par défaut
+    wb.remove(wb.active)
 
+    # INSEE (5 onglets thématiques)
     _onglet_geo(wb, communes_data)
     _onglet_logement(wb, communes_data)
     _onglet_revenus(wb, communes_data)
     _onglet_emploi(wb, communes_data)
     _onglet_etablissements(wb, communes_data)
+    # Autres sources (4 onglets)
+    _onglet_pharmacies_mm(wb, pj_data)
+    _onglet_maternites(wb, maternites)
+    _onglet_sages_femmes(wb, sages_femmes)
+    _onglet_lactariums(wb, lactariums)
+    _onglet_pmi(wb, pmi)
+    # Synthèse globale (1 onglet)
     _onglet_synthese(wb, communes_data, pj_data, maternites, lactariums, sages_femmes, pmi,
                      zone_nom, dept_code, dept_nom, region)
 

@@ -83,19 +83,94 @@ def _clean_value(val: str) -> str:
     return val.replace("\xa0", " ").replace(" ", " ").replace("–", "-").strip()
 
 
-def _scrape_batch(cog_codes: list[str]) -> dict[str, dict]:
+def _search_add_commune(page, nom: str, cog: str) -> bool:
+    """Ajoute une commune au comparateur via la barre de recherche (par nom)."""
+    for inp_sel in [
+        "input[placeholder*='territoire']",
+        "input[placeholder*='commune']",
+        "input[placeholder*='Territoire']",
+        "input[aria-autocomplete='list']",
+        ".comparateur input[type='text']",
+        "input[type='text']",
+    ]:
+        try:
+            inp = page.locator(inp_sel).first
+            if not inp.is_visible(timeout=1500):
+                continue
+            inp.click()
+            inp.fill("")
+            inp.type(nom, delay=80)
+            time.sleep(1.5)
+            for res_sel in [
+                "li[class*='suggestion']", "[class*='autocomplete'] li",
+                "[role='option']", "ul[class*='dropdown'] li", ".tt-suggestion",
+            ]:
+                items = page.locator(res_sel).all()
+                for item in items:
+                    txt = item.inner_text()
+                    if "COM" in txt and (cog in txt or nom[:6].lower() in txt.lower()):
+                        item.click()
+                        time.sleep(0.5)
+                        return True
+                for item in items:
+                    if "COM" in item.inner_text():
+                        item.click()
+                        time.sleep(0.5)
+                        return True
+            break
+        except Exception:
+            pass
+    return False
+
+
+def _extract_tables(page, results: dict) -> None:
+    """Extrait les données des tableaux comparatifs et remplit results."""
+    tables = page.query_selector_all("table")
+    for table in tables:
+        rows = table.query_selector_all("tr")
+        if len(rows) < 2:
+            continue
+        header_cells = rows[0].query_selector_all("th, td")
+        col_to_cog: dict[int, str] = {}
+        for col_idx, cell in enumerate(header_cells):
+            cell_text = cell.inner_text().strip()
+            m = re.search(r"\((\d{5})\)", cell_text) or re.search(r"\b(\d{5})\b", cell_text)
+            if m and m.group(1) in results:
+                col_to_cog[col_idx] = m.group(1)
+        for row in rows[1:]:
+            cells = row.query_selector_all("th, td")
+            if not cells:
+                continue
+            label = cells[0].inner_text().strip()
+            key = _match_label(label)
+            if not key:
+                continue
+            for col_idx, cog in col_to_cog.items():
+                if col_idx < len(cells):
+                    val = _clean_value(cells[col_idx].inner_text().strip())
+                    if val:
+                        results[cog][key] = val
+
+
+def _scrape_batch(communes_batch: list[dict]) -> dict[str, dict]:
     """
-    Scrape le comparateur INSEE pour un lot de codes COG.
-    Retourne dict { "07029": {indicateurs...}, "07058": {...}, ... }
+    Scrape le comparateur INSEE pour un lot de communes.
+    communes_batch : list[dict] avec 'nom' et 'code_insee'.
+    Retourne dict { "57022": {indicateurs...}, ... }
     """
     if not _PLAYWRIGHT_OK:
         print("[INSEE] Playwright non disponible — données INSEE non collectées")
-        return {cog: {} for cog in cog_codes}
+        return {c["code_insee"]: {} for c in communes_batch if c.get("code_insee")}
+
+    cog_codes = [c["code_insee"] for c in communes_batch if c.get("code_insee")]
+    if not cog_codes:
+        return {}
 
     geo_param = "+".join(f"COM-{cog}" for cog in cog_codes)
     url = f"{_BASE_URL}?geo={geo_param}&debut=0"
 
     results: dict[str, dict] = {cog: {} for cog in cog_codes}
+    cog_to_nom = {c["code_insee"]: c.get("nom", "") for c in communes_batch if c.get("code_insee")}
 
     try:
         with sync_playwright() as pw:
@@ -105,50 +180,41 @@ def _scrape_batch(cog_codes: list[str]) -> dict[str, dict]:
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36"
             )
             page.goto(url, wait_until="networkidle", timeout=40000)
-            time.sleep(3)
 
-            # Cliquer sur "COMPARER LES TERRITOIRES"
-            btn = page.get_by_text("COMPARER LES TERRITOIRES")
-            if btn.count() > 0:
-                btn.first.click()
+            # Attendre et cliquer sur le bouton de comparaison (insensible à la casse)
+            try:
+                page.wait_for_selector("button:has-text('comparer')", timeout=15000)
+            except Exception:
+                pass
+
+            clicked = False
+            for txt in ["COMPARER LES TERRITOIRES", "Comparer les territoires", "comparer"]:
+                btn = page.get_by_text(txt, exact=False)
+                if btn.count() > 0:
+                    btn.first.click()
+                    clicked = True
+                    break
+            if clicked:
                 page.wait_for_load_state("networkidle", timeout=30000)
                 time.sleep(4)
 
-            # Extraire tous les tableaux
-            tables = page.query_selector_all("table")
+            # Première extraction via les tableaux déjà présents
+            _extract_tables(page, results)
 
-            for table in tables:
-                rows = table.query_selector_all("tr")
-                if len(rows) < 2:
-                    continue
-
-                # Ligne d'en-tête → mapper colonne → code COG
-                header_cells = rows[0].query_selector_all("th, td")
-                col_to_cog: dict[int, str] = {}
-
-                for col_idx, cell in enumerate(header_cells):
-                    cell_text = cell.inner_text().strip()
-                    # Format : "Commune : Beaumont (07029)"
-                    cog_match = re.search(r"\((\d{5})\)", cell_text)
-                    if cog_match:
-                        col_to_cog[col_idx] = cog_match.group(1)
-
-                # Lignes de données
-                for row in rows[1:]:
-                    cells = row.query_selector_all("th, td")
-                    if not cells:
-                        continue
-
-                    label = cells[0].inner_text().strip() if cells else ""
-                    key = _match_label(label)
-                    if not key:
-                        continue
-
-                    for col_idx, cog in col_to_cog.items():
-                        if col_idx < len(cells):
-                            val = _clean_value(cells[col_idx].inner_text().strip())
-                            if cog in results:
-                                results[cog][key] = val
+            # Pour les communes sans données → recherche par nom dans le comparateur
+            for cog in cog_codes:
+                if not results[cog]:
+                    nom = cog_to_nom.get(cog, "")
+                    if nom:
+                        print(f"[INSEE] Recherche par nom : {nom} ({cog})")
+                        added = _search_add_commune(page, nom, cog)
+                        if added:
+                            try:
+                                page.wait_for_load_state("networkidle", timeout=15000)
+                            except Exception:
+                                pass
+                            time.sleep(2)
+                            _extract_tables(page, results)
 
             browser.close()
 
@@ -203,10 +269,13 @@ def get_all_communes_data(communes: list[dict]) -> list[dict]:
 
     # Scraper par lots de MAX_COMMUNES_PER_REQUEST
     all_scraped: dict[str, dict] = {}
-    cog_list = list(commune_by_cog.keys())
+    communes_with_cog = [
+        {**c, "code_insee": cog} if not c.get("code_insee") else c
+        for cog, c in commune_by_cog.items()
+    ]
 
-    for i in range(0, len(cog_list), _MAX_COMMUNES_PER_REQUEST):
-        batch = cog_list[i: i + _MAX_COMMUNES_PER_REQUEST]
+    for i in range(0, len(communes_with_cog), _MAX_COMMUNES_PER_REQUEST):
+        batch = communes_with_cog[i: i + _MAX_COMMUNES_PER_REQUEST]
         batch_data = _scrape_batch(batch)
         all_scraped.update(batch_data)
 

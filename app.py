@@ -3,6 +3,7 @@ Interface web — Mise à jour DIP Tire-Lait Express
 Lancer : streamlit run app.py
 """
 
+import io
 import re
 import sys
 import concurrent.futures
@@ -203,6 +204,25 @@ def _build_insee_pivot(insee_data: list[dict], all_communes: list[dict] | None =
     return df.style.apply(_highlight, axis=None)
 
 
+# ── Helper export Excel ───────────────────────────────────────────────────────
+
+def _df_to_xlsx(df: pd.DataFrame) -> bytes:
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="Données")
+    return buf.getvalue()
+
+
+def _dl_button(df: pd.DataFrame, label: str, filename: str) -> None:
+    today = date.today().strftime("%Y-%m-%d")
+    st.download_button(
+        label=f"⬇️ Télécharger {label} (.xlsx)",
+        data=_df_to_xlsx(df),
+        file_name=f"{filename}_{today}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+
 # ── Header ────────────────────────────────────────────────────────────────────
 
 st.title("👶 Mise à jour DIP — Tire-Lait Express")
@@ -381,13 +401,6 @@ elif st.session_state.step == 3:
             "args":  (communes_flat,),
         },
         {
-            "key":   "pages_jaunes",
-            "label": "💊 Pharmacies",
-            "desc":  "Pages Jaunes — pharmacies & matériel médical",
-            "fn":    get_pharmacies_and_medical,
-            "args":  (communes_pj,),
-        },
-        {
             "key":   "lactariums",
             "label": "🥛 Lactariums",
             "desc":  "ALF — lactariums",
@@ -407,6 +420,13 @@ elif st.session_state.step == 3:
             "desc":  "AlloPMI — PMI",
             "fn":    get_pmi,
             "args":  (dept_code, dept_nom, cp_uniques, communes_pj),
+        },
+        {
+            "key":   "pages_jaunes",
+            "label": "💊 Pharmacies",
+            "desc":  "Pages Jaunes — pharmacies & matériel médical",
+            "fn":    get_pharmacies_and_medical,
+            "args":  (communes_pj,),
         },
     ]
 
@@ -461,27 +481,39 @@ elif st.session_state.step == 3:
                                  "Niveau": m.get("type_niveau",""), "Accouchements/an": m.get("nb_accouchements_an",""), "Ville": m.get("ville","")})
             else:
                 rows.append({"CP": cp, "Maternité": "—", "Statut": "", "Niveau": "", "Accouchements/an": "", "Ville": ""})
-        st.dataframe(pd.DataFrame(rows), width='stretch', hide_index=True)
+        df_mat = pd.DataFrame(rows)
+        st.dataframe(df_mat, width='stretch', hide_index=True)
+        if rows:
+            _dl_button(df_mat, "Maternités", "maternites")
 
     elif key == "insee" and isinstance(data, list):
         if data:
             st.dataframe(_build_insee_pivot(data, st.session_state.get("communes_flat")), width='stretch', hide_index=True)
+            df_insee = pd.DataFrame([
+                {k: v for k, v in r.items() if not k.startswith("_")} | {"Statut": r.get("_statut", "")}
+                for r in data
+            ])
+            _dl_button(df_insee, "INSEE", "insee")
         else:
             st.warning("Aucune donnée INSEE récupérée.")
 
     elif key == "pages_jaunes" and isinstance(data, list):
         if data:
-            df = pd.DataFrame([{
+            df_pj = pd.DataFrame([{
                 "Commune": r.get("commune",""), "CP": r.get("cp",""),
-                "Pharmacies": r.get("nb_pharmacies",0), "Magasin matériel médical": r.get("nb_materiel_medical",0),
+                "Nb pharmacies": r.get("nb_pharmacies",0),
+                "Noms pharmacies": " | ".join(r.get("noms_pharmacies",[])),
+                "Nb mat. médical": r.get("nb_materiel_medical",0),
+                "Noms mat. médical": " | ".join(r.get("noms_materiel_medical",[])),
             } for r in data])
-            st.dataframe(df, width='stretch', hide_index=True)
+            st.dataframe(df_pj[["Commune","CP","Nb pharmacies","Nb mat. médical"]], width='stretch', hide_index=True)
+            _dl_button(df_pj, "Pharmacies & Matériel médical", "pharmacies_mm")
         else:
             st.warning("Aucune donnée Pages Jaunes récupérée.")
 
     elif key == "lactariums" and isinstance(data, list):
         if data:
-            st.dataframe(pd.DataFrame([{
+            df_lac = pd.DataFrame([{
                 "Nom":         r.get("nom", ""),
                 "CP":          r.get("cp", ""),
                 "Ville":       r.get("ville", ""),
@@ -491,27 +523,31 @@ elif st.session_state.step == 3:
                 "Type":        r.get("type", ""),
                 "Don anonyme": r.get("don_anonyme", ""),
                 "Équipe":      " / ".join(r.get("equipe", [])[:3]),
-            } for r in data]), width='stretch', hide_index=True)
+            } for r in data])
+            st.dataframe(df_lac, width='stretch', hide_index=True)
+            _dl_button(df_lac, "Lactariums", "lactariums")
         else:
             st.info("Aucun lactarium dans votre zone.")
 
     elif key == "sages_femmes" and isinstance(data, list):
         if data:
             st.metric("Sages-femmes (dédoublonnées)", len(data))
-            st.dataframe(pd.DataFrame([{
-                "Nom":          f"{r.get('nom','')} {r.get('prenom','')}".strip(),
+            df_sf = pd.DataFrame([{
+                "Nom":           f"{r.get('nom','')} {r.get('prenom','')}".strip(),
                 "Codes postaux": r.get("code_postaux_display", r.get("cp", "")),
-                "Adresse":      r.get("adresse", ""),
-                "Tél.":         r.get("telephone", ""),
-                "Email":        r.get("email", ""),
-            } for r in data]), width='stretch', hide_index=True)
+                "Adresse":       r.get("adresse", ""),
+                "Tél.":          r.get("telephone", ""),
+                "Email":         r.get("email", ""),
+            } for r in data])
+            st.dataframe(df_sf, width='stretch', hide_index=True)
+            _dl_button(df_sf, "Sages-femmes", "sages_femmes")
         else:
             st.warning("Aucune sage-femme trouvée.")
 
     elif key == "pmi" and isinstance(data, list):
         if data:
             st.metric("Centres PMI", len(data))
-            st.dataframe(pd.DataFrame([{
+            df_pmi = pd.DataFrame([{
                 "Nom":       r.get("nom", ""),
                 "CP":        r.get("cp", ""),
                 "Ville":     r.get("ville", ""),
@@ -519,7 +555,9 @@ elif st.session_state.step == 3:
                 "Téléphone": r.get("telephone", ""),
                 "Email":     r.get("email", ""),
                 "Horaires":  r.get("horaires", ""),
-            } for r in data]), width='stretch', hide_index=True)
+            } for r in data])
+            st.dataframe(df_pmi, width='stretch', hide_index=True)
+            _dl_button(df_pmi, "PMI", "pmi")
         else:
             st.info("Aucune PMI dans votre zone.")
 
