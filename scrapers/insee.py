@@ -176,7 +176,13 @@ def _scrape_batch(communes_batch: list[dict]) -> dict[str, dict]:
         with sync_playwright() as pw:
             browser = pw.chromium.launch(
                 headless=True,
-                args=["--no-sandbox", "--disable-dev-shm-usage"],
+                args=[
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
+                    "--disable-setuid-sandbox",
+                    "--single-process",
+                ],
             )
             page = browser.new_page(
                 locale="fr-FR",
