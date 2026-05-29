@@ -46,7 +46,7 @@ def _dept_nom(dept_code: str) -> str:
 def _get_maternite_links(dept_code: str) -> list[str]:
     """
     Retourne toutes les URLs de fiches maternité du département.
-    Format URL : /maman/maternite/maternite-xxx/maternite-YYYYYYY
+    Parcourt aussi les pages intermédiaires "ville" (ex: /maman/maternite/saumur/ville-49328).
     """
     dept_nom = _dept_nom(dept_code)
     if not dept_nom:
@@ -54,6 +54,17 @@ def _get_maternite_links(dept_code: str) -> list[str]:
 
     dept_slug = _slugify(dept_nom)
     url = _DEPT_PAGE.format(dept_slug=dept_slug, dept_code=dept_code)
+    base = "https://www.journaldesfemmes.fr"
+
+    def _extract_fiche_links(soup) -> list[str]:
+        links = []
+        for a in soup.select('a[href*="/maternite-"]'):
+            href = a.get("href", "")
+            if re.search(r"/maternite-\d+$", href):
+                full = href if href.startswith("http") else base + href
+                if full not in links:
+                    links.append(full)
+        return links
 
     try:
         time.sleep(REQUEST_DELAY)
@@ -61,15 +72,32 @@ def _get_maternite_links(dept_code: str) -> list[str]:
         if r.status_code != 200:
             return []
         soup = BeautifulSoup(r.text, "html.parser")
-        base = "https://www.journaldesfemmes.fr"
-        links = []
-        for a in soup.select('a[href*="/maternite-"]'):
+
+        # Fiches directement sur la page département
+        links = _extract_fiche_links(soup)
+
+        # Pages ville intermédiaires (ex: /maman/maternite/saumur/ville-49328)
+        ville_urls = []
+        for a in soup.select('a[href*="/ville-"]'):
             href = a.get("href", "")
-            # Garder uniquement les fiches individuelles (pas les pages ville)
-            if re.search(r"/maternite-\d+$", href):
+            if re.search(r"/ville-\d+$", href):
                 full = href if href.startswith("http") else base + href
-                if full not in links:
-                    links.append(full)
+                if full not in ville_urls:
+                    ville_urls.append(full)
+
+        for ville_url in ville_urls:
+            try:
+                time.sleep(REQUEST_DELAY)
+                rv = requests.get(ville_url, headers=HEADERS, timeout=20)
+                if rv.status_code != 200:
+                    continue
+                ville_soup = BeautifulSoup(rv.text, "html.parser")
+                for lnk in _extract_fiche_links(ville_soup):
+                    if lnk not in links:
+                        links.append(lnk)
+            except Exception:
+                continue
+
         return links
     except Exception:
         return []
@@ -158,6 +186,15 @@ def get_maternites_par_cp(cp_communes: dict[str, list[dict]]) -> dict[str, list[
     """
     source_date = time.strftime("%d/%m/%Y")
     result: dict[str, list[dict]] = {cp: [] for cp in cp_communes}
+    seen: set[tuple[str, str]] = set()  # (url_source, cp) déjà ajoutés
+
+    # Index nom de ville (slugifié) → CP pour le fallback CEDEX
+    city_to_cp: dict[str, str] = {}
+    for cp, communes in cp_communes.items():
+        for c in communes:
+            slug = _slugify(c.get("nom", ""))
+            if slug:
+                city_to_cp[slug] = cp
 
     # Grouper les CP par département pour ne charger la page dept qu'une seule fois
     dept_to_cps: dict[str, list[str]] = {}
@@ -180,10 +217,29 @@ def get_maternites_par_cp(cp_communes: dict[str, list[dict]]) -> dict[str, list[
 
             cp_fiche = fiche.get("cp", "")
 
-            # 3. Filtre strict : affecter au CP qui correspond exactement
+            url_src = fiche.get("url_source", "")
+
+            # 3a. Correspondance directe par CP
             if cp_fiche in result:
-                fiche["_cp_recherche"] = cp_fiche
-                result[cp_fiche].append(fiche)
+                key = (url_src, cp_fiche)
+                if key not in seen:
+                    seen.add(key)
+                    fiche["_cp_recherche"] = cp_fiche
+                    result[cp_fiche].append(fiche)
+                continue
+
+            # 3b. Fallback : certains hôpitaux ont un code CEDEX différent du CP
+            # de la commune (ex: 49403 pour Saumur au lieu de 49400).
+            # On cherche par nom de ville.
+            ville_slug = _slugify(fiche.get("ville", ""))
+            if ville_slug:
+                matched_cp = city_to_cp.get(ville_slug)
+                if matched_cp and matched_cp in result:
+                    key = (url_src, matched_cp)
+                    if key not in seen:
+                        seen.add(key)
+                        fiche["_cp_recherche"] = matched_cp
+                        result[matched_cp].append(fiche)
 
     return result
 

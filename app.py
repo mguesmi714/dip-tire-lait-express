@@ -84,6 +84,7 @@ def _init():
         "cp_uniques": [],
         "communes_par_cp": {},
         "dept_code": "",
+        "dept_codes": [],
         "dept_nom": "",
         "region": "",
         "results": {},
@@ -325,9 +326,14 @@ if st.session_state.step == 1:
         st.session_state.communes_par_cp = communes_par_cp
 
         dept_code, dept_nom, region = _inferer_zone(cp_uniques)
-        st.session_state.dept_code = dept_code
-        st.session_state.dept_nom  = dept_nom
-        st.session_state.region    = region
+        dept_codes = list(dict.fromkeys(
+            cp[:3] if cp.startswith("97") else cp[:2]
+            for cp in cp_uniques
+        ))
+        st.session_state.dept_code  = dept_code
+        st.session_state.dept_codes = dept_codes
+        st.session_state.dept_nom   = dept_nom
+        st.session_state.region     = region
 
         st.session_state.step = 2
         st.rerun()
@@ -392,6 +398,10 @@ elif st.session_state.step == 3:
     communes_par_cp = st.session_state.communes_par_cp
     cp_uniques      = st.session_state.cp_uniques
     dept_code       = st.session_state.dept_code
+    dept_codes      = list(dict.fromkeys(
+        cp[:3] if cp.startswith("97") else cp[:2]
+        for cp in cp_uniques
+    )) or [dept_code]
     dept_nom        = st.session_state.dept_nom
     region          = st.session_state.region
 
@@ -410,7 +420,15 @@ elif st.session_state.step == 3:
 
     st.session_state.communes_flat = communes_flat
 
-    communes_pj = [{"nom": c["nom"], "cp": c.get("cp", "")} for c in communes_flat]
+    communes_pj = [
+        {
+            "nom":       c["nom"],
+            "cp":        c.get("cp", ""),
+            "dept_code": (c.get("departement") or {}).get("code", "") or c.get("cp", "")[:2],
+            "dept_nom":  (c.get("departement") or {}).get("nom", ""),
+        }
+        for c in communes_flat
+    ]
 
     cp_communes_dict = {
         cp: [dict(c, code_insee=c.get("code_insee") or c.get("code", "")) for c in communes]
@@ -445,7 +463,7 @@ elif st.session_state.step == 3:
             "label": "🤱 Sages-femmes",
             "desc":  "Ordre SF — sages-femmes libérales",
             "fn":    get_sages_femmes,
-            "args":  (dept_code, cp_uniques),
+            "args":  (dept_codes, cp_uniques),
         },
         {
             "key":   "pmi",
@@ -463,212 +481,193 @@ elif st.session_state.step == 3:
         },
     ]
 
-    cs = st.session_state.collect_step  # 1..6
-    current = COLLECT_STEPS[cs - 1]
-
-    # Barre de progression des sous-étapes
-    st.subheader(f"⚙️ Étape 3 — Collecte  ({cs}/{len(COLLECT_STEPS)})")
-    mini_cols = st.columns(len(COLLECT_STEPS))
-    for i, s in enumerate(COLLECT_STEPS, 1):
-        with mini_cols[i - 1]:
-            if i < cs:
-                st.markdown(f"<span style='color:#2e7d32'>✓ {s['label']}</span>", unsafe_allow_html=True)
-            elif i == cs:
-                st.markdown(f"<span style='color:#1F4E79;font-weight:bold'>▶ {s['label']}</span>", unsafe_allow_html=True)
-            else:
-                st.markdown(f"<span style='color:#aaa'>{s['label']}</span>", unsafe_allow_html=True)
-
-    st.divider()
-
-    # ── Lancer la sous-étape courante ─────────────────────────────────────────
-    key = current["key"]
-
-    # Si pas encore de résultat pour cette clé, lancer le scraper
-    if key not in st.session_state.results:
-        with st.spinner(f"Collecte en cours : {current['desc']}…"):
-            try:
-                data = current["fn"](*current["args"])
-                st.session_state.results[key] = data
-                err = None
-            except Exception as e:
-                st.session_state.results[key] = {} if key == "maternites" else []
-                err = str(e)
-
-        if err:
-            st.error(f"Erreur : {err}")
-        else:
-            st.success(f"✅ {current['desc']} — collecte terminée")
+    # ── Lancer un scraper si demandé ──────────────────────────────────────────
+    launch_key = st.session_state.pop("_launch_key", None)
+    if launch_key:
+        step_to_run = next((s for s in COLLECT_STEPS if s["key"] == launch_key), None)
+        if step_to_run:
+            with st.spinner(f"Collecte : {step_to_run['desc']}…"):
+                try:
+                    result_data = step_to_run["fn"](*step_to_run["args"])
+                    st.session_state.results[launch_key] = result_data
+                except Exception as e:
+                    st.session_state.results[launch_key] = {} if launch_key == "maternites" else []
+                    st.error(f"Erreur {step_to_run['label']} : {e}")
         st.rerun()
 
-    # ── Afficher les résultats de la sous-étape ───────────────────────────────
-    data = st.session_state.results.get(key)
+    # ── Cartes indépendantes ──────────────────────────────────────────────────
+    st.subheader("⚙️ Étape 3 — Collecte des données")
+    st.caption("Lancez chaque source indépendamment, dans n'importe quel ordre.")
 
-    st.markdown(f"### {current['label']} — Résultats")
-
-    if key == "maternites" and isinstance(data, dict):
-        rows = []
-        for cp, mats in data.items():
-            if mats:
-                for m in mats:
-                    rows.append({"CP": cp, "Maternité": m.get("nom",""), "Statut": m.get("statut",""),
-                                 "Niveau": m.get("type_niveau",""), "Accouchements/an": m.get("nb_accouchements_an",""), "Ville": m.get("ville","")})
-            else:
-                rows.append({"CP": cp, "Maternité": "—", "Statut": "", "Niveau": "", "Accouchements/an": "", "Ville": ""})
-        df_mat = pd.DataFrame(rows)
-        st.dataframe(df_mat, width='stretch', hide_index=True)
-        if rows:
-            _dl_button(df_mat, "Maternités", "maternites")
-
-    elif key == "insee" and isinstance(data, list):
-        if data:
-            st.dataframe(_build_insee_pivot(data, st.session_state.get("communes_flat")), width='stretch', hide_index=True)
-            df_insee = pd.DataFrame([
-                {k: v for k, v in r.items() if not k.startswith("_")} | {"Statut": r.get("_statut", "")}
-                for r in data
-            ])
-            _dl_button(df_insee, "INSEE", "insee")
-        else:
-            st.warning("Aucune donnée INSEE récupérée.")
-
-    elif key == "pages_jaunes" and isinstance(data, list):
-        if data:
-            df_pj = pd.DataFrame([{
-                "Commune": r.get("commune",""), "CP": r.get("cp",""),
-                "Nb pharmacies": r.get("nb_pharmacies",0),
-                "Noms pharmacies": " | ".join(r.get("noms_pharmacies",[])),
-                "Nb mat. médical": r.get("nb_materiel_medical",0),
-                "Noms mat. médical": " | ".join(r.get("noms_materiel_medical",[])),
-            } for r in data])
-            st.dataframe(df_pj[["Commune","CP","Nb pharmacies","Nb mat. médical"]], width='stretch', hide_index=True)
-            _dl_button(df_pj, "Pharmacies & Matériel médical", "pharmacies_mm")
-        else:
-            st.warning("Aucune donnée Pages Jaunes récupérée.")
-
-    elif key == "lactariums" and isinstance(data, list):
-        if data:
-            df_lac = pd.DataFrame([{
-                "Nom":         r.get("nom", ""),
-                "CP":          r.get("cp", ""),
-                "Ville":       r.get("ville", ""),
-                "Adresse":     r.get("adresse", ""),
-                "Tél.":        r.get("telephone", ""),
-                "Email":       r.get("email", ""),
-                "Type":        r.get("type", ""),
-                "Don anonyme": r.get("don_anonyme", ""),
-                "Équipe":      " / ".join(r.get("equipe", [])[:3]),
-            } for r in data])
-            st.dataframe(df_lac, width='stretch', hide_index=True)
-            _dl_button(df_lac, "Lactariums", "lactariums")
-        else:
-            st.info("Aucun lactarium dans votre zone.")
-
-    elif key == "sages_femmes" and isinstance(data, list):
-        if data:
-            st.metric("Sages-femmes (dédoublonnées)", len(data))
-            df_sf = pd.DataFrame([{
-                "Nom":           f"{r.get('nom','')} {r.get('prenom','')}".strip(),
-                "Codes postaux": r.get("code_postaux_display", r.get("cp", "")),
-                "Adresse":       r.get("adresse", ""),
-                "Tél.":          r.get("telephone", ""),
-                "Email":         r.get("email", ""),
-            } for r in data])
-            st.dataframe(df_sf, width='stretch', hide_index=True)
-            _dl_button(df_sf, "Sages-femmes", "sages_femmes")
-        else:
-            st.warning("Aucune sage-femme trouvée.")
-
-    elif key == "pmi" and isinstance(data, list):
-        if data:
-            st.metric("Centres PMI", len(data))
-            df_pmi = pd.DataFrame([{
-                "Nom":       r.get("nom", ""),
-                "CP":        r.get("cp", ""),
-                "Ville":     r.get("ville", ""),
-                "Adresse":   r.get("adresse", ""),
-                "Téléphone": r.get("telephone", ""),
-                "Email":     r.get("email", ""),
-                "Horaires":  r.get("horaires", ""),
-            } for r in data])
-            st.dataframe(df_pmi, width='stretch', hide_index=True)
-            _dl_button(df_pmi, "PMI", "pmi")
-        else:
-            st.info("Aucune PMI dans votre zone.")
+    card_cols = st.columns(3)
+    for i, step in enumerate(COLLECT_STEPS):
+        key = step["key"]
+        data = st.session_state.results.get(key)
+        with card_cols[i % 3]:
+            with st.container(border=True):
+                if data is None:
+                    icon, caption = "⚪", "À lancer"
+                else:
+                    icon = "✅"
+                    if isinstance(data, list):
+                        caption = f"{len(data)} résultat(s)" if data else "Aucun résultat"
+                    elif isinstance(data, dict):
+                        n = sum(len(v) for v in data.values() if isinstance(v, list))
+                        caption = f"{n} résultat(s)" if n else "Aucun résultat"
+                    else:
+                        caption = "OK"
+                st.markdown(f"{icon} **{step['label']}**")
+                st.caption(caption)
+                btn_lbl = "🔄 Relancer" if data is not None else "▶ Lancer"
+                if st.button(btn_lbl, key=f"btn_{key}", use_container_width=True):
+                    st.session_state.results.pop(key, None)
+                    st.session_state["_launch_key"] = key
+                    st.rerun()
 
     st.divider()
 
-    # ── Boutons navigation ────────────────────────────────────────────────────
-    col_back, col_retry, col_next = st.columns([1, 1, 4])
+    # ── Résultats par source (expandables) ───────────────────────────────────
+    for step in COLLECT_STEPS:
+        key  = step["key"]
+        data = st.session_state.results.get(key)
+        if data is None:
+            continue
+        with st.expander(f"{step['label']} — Résultats", expanded=False):
+            if key == "maternites" and isinstance(data, dict):
+                rows = []
+                for cp, mats in data.items():
+                    if mats:
+                        for m in mats:
+                            rows.append({"CP": cp, "Maternité": m.get("nom",""), "Statut": m.get("statut",""),
+                                         "Niveau": m.get("type_niveau",""), "Accouchements/an": m.get("nb_accouchements_an",""), "Ville": m.get("ville","")})
+                    else:
+                        rows.append({"CP": cp, "Maternité": "—", "Statut": "", "Niveau": "", "Accouchements/an": "", "Ville": ""})
+                df_mat = pd.DataFrame(rows)
+                st.dataframe(df_mat, use_container_width=True, hide_index=True)
+                if rows:
+                    _dl_button(df_mat, "Maternités", "maternites")
 
+            elif key == "insee" and isinstance(data, list):
+                if data:
+                    st.dataframe(_build_insee_pivot(data, st.session_state.get("communes_flat")), use_container_width=True, hide_index=True)
+                    df_insee = pd.DataFrame([
+                        {k: v for k, v in r.items() if not k.startswith("_")} | {"Statut": r.get("_statut", "")}
+                        for r in data
+                    ])
+                    _dl_button(df_insee, "INSEE", "insee")
+                else:
+                    st.warning("Aucune donnée INSEE récupérée.")
+
+            elif key == "pages_jaunes" and isinstance(data, list):
+                if data:
+                    df_pj = pd.DataFrame([{
+                        "Commune": r.get("commune",""), "CP": r.get("cp",""),
+                        "Nb pharmacies": r.get("nb_pharmacies",0),
+                        "Noms pharmacies": " | ".join(r.get("noms_pharmacies",[])),
+                        "Nb mat. médical": r.get("nb_materiel_medical",0),
+                        "Noms mat. médical": " | ".join(r.get("noms_materiel_medical",[])),
+                    } for r in data])
+                    st.dataframe(df_pj[["Commune","CP","Nb pharmacies","Nb mat. médical"]], use_container_width=True, hide_index=True)
+                    _dl_button(df_pj, "Pharmacies & Matériel médical", "pharmacies_mm")
+                else:
+                    st.warning("Aucune donnée Pages Jaunes récupérée.")
+
+            elif key == "lactariums" and isinstance(data, list):
+                if data:
+                    df_lac = pd.DataFrame([{
+                        "Nom": r.get("nom",""), "CP": r.get("cp",""), "Ville": r.get("ville",""),
+                        "Adresse": r.get("adresse",""), "Tél.": r.get("telephone",""),
+                        "Email": r.get("email",""), "Type": r.get("type",""),
+                        "Don anonyme": r.get("don_anonyme",""),
+                        "Équipe": " / ".join(r.get("equipe",[])[:3]),
+                    } for r in data])
+                    st.dataframe(df_lac, use_container_width=True, hide_index=True)
+                    _dl_button(df_lac, "Lactariums", "lactariums")
+                else:
+                    st.info("Aucun lactarium dans votre zone.")
+
+            elif key == "sages_femmes" and isinstance(data, list):
+                if data:
+                    st.metric("Sages-femmes (dédoublonnées)", len(data))
+                    df_sf = pd.DataFrame([{
+                        "Nom": f"{r.get('nom','')} {r.get('prenom','')}".strip(),
+                        "Codes postaux": r.get("code_postaux_display", r.get("cp","")),
+                        "Adresse": r.get("adresse",""), "Tél.": r.get("telephone",""),
+                        "Email": r.get("email",""),
+                    } for r in data])
+                    st.dataframe(df_sf, use_container_width=True, hide_index=True)
+                    _dl_button(df_sf, "Sages-femmes", "sages_femmes")
+                else:
+                    st.warning("Aucune sage-femme trouvée.")
+
+            elif key == "pmi" and isinstance(data, list):
+                if data:
+                    st.metric("Centres PMI", len(data))
+                    df_pmi = pd.DataFrame([{
+                        "Nom": r.get("nom",""), "CP": r.get("cp",""), "Ville": r.get("ville",""),
+                        "Adresse": r.get("adresse",""), "Téléphone": r.get("telephone",""),
+                        "Email": r.get("email",""), "Horaires": r.get("horaires",""),
+                    } for r in data])
+                    st.dataframe(df_pmi, use_container_width=True, hide_index=True)
+                    _dl_button(df_pmi, "PMI", "pmi")
+                else:
+                    st.info("Aucune PMI dans votre zone.")
+
+    st.divider()
+
+    # ── Navigation ────────────────────────────────────────────────────────────
+    col_back, col_gen = st.columns([1, 3])
     with col_back:
-        if st.button("← Retour"):
-            if cs > 1:
-                # Effacer le résultat de l'étape courante pour pouvoir la relancer
-                st.session_state.results.pop(key, None)
-                st.session_state.collect_step -= 1
-            else:
-                st.session_state.step = 2
-                st.session_state.collect_step = 1
-                st.session_state.results = {}
+        if st.button("← Retour étape 2"):
+            st.session_state.step = 2
+            st.session_state.results = {}
             st.rerun()
+    with col_gen:
+        if st.button("✅ Valider et générer les fichiers", type="primary"):
+            results = st.session_state.results
+            mat_raw = results.get("maternites", {})
+            maternites_flat = [
+                dict(m, _cp_recherche=cp)
+                for cp, mats in (mat_raw.items() if isinstance(mat_raw, dict) else {}.items())
+                for m in mats
+            ]
+            today     = date.today().strftime("%Y-%m-%d")
+            zone_slug = f"DIP_{dept_nom or dept_code}".replace(" ", "_")[:30]
+            out_dir   = Path(__file__).parent / "output"
+            out_dir.mkdir(exist_ok=True)
+            xlsx_path = str(out_dir / f"donnees_{zone_slug}_{today}.xlsx")
+            docx_path = str(out_dir / f"synthese_{zone_slug}_{today}.docx")
+            zone_nom  = f"{dept_nom} ({dept_code})" if dept_nom else dept_code
 
-    with col_retry:
-        if st.button("🔄 Relancer"):
-            st.session_state.results.pop(key, None)
+            with st.spinner("Génération du fichier Excel…"):
+                generate_excel(
+                    output_path=xlsx_path, zone_nom=zone_nom,
+                    dept_code=dept_code, dept_nom=dept_nom, region=region,
+                    communes_data=results.get("insee", []),
+                    pj_data=results.get("pages_jaunes", []),
+                    maternites=maternites_flat,
+                    lactariums=results.get("lactariums", []),
+                    sages_femmes=results.get("sages_femmes", []),
+                    pmi=results.get("pmi", []),
+                )
+                st.session_state.xlsx_bytes = open(xlsx_path, "rb").read()
+
+            with st.spinner("Génération du document Word…"):
+                generate_word(
+                    output_path=docx_path, zone_nom=zone_nom,
+                    dept_code=dept_code, dept_nom=dept_nom, region=region,
+                    communes=communes_flat,
+                    communes_data=results.get("insee", []),
+                    pj_data=results.get("pages_jaunes", []),
+                    maternites=maternites_flat,
+                    lactariums=results.get("lactariums", []),
+                    sages_femmes=results.get("sages_femmes", []),
+                    pmi=results.get("pmi", []),
+                )
+                st.session_state.docx_bytes = open(docx_path, "rb").read()
+
+            st.session_state.step = 4
             st.rerun()
-
-    with col_next:
-        next_label = "Valider et continuer →" if cs < len(COLLECT_STEPS) else "✅ Valider et générer les fichiers"
-        if st.button(next_label, type="primary"):
-            if cs < len(COLLECT_STEPS):
-                st.session_state.collect_step += 1
-                st.rerun()
-            else:
-                # Toutes les sous-étapes validées → générer les fichiers
-                results = st.session_state.results
-                mat_raw = results.get("maternites", {})
-                maternites_flat = [
-                    dict(m, _cp_recherche=cp)
-                    for cp, mats in (mat_raw.items() if isinstance(mat_raw, dict) else {}.items())
-                    for m in mats
-                ]
-                today     = date.today().strftime("%Y-%m-%d")
-                zone_slug = f"DIP_{dept_nom or dept_code}".replace(" ", "_")[:30]
-                out_dir   = Path(__file__).parent / "output"
-                out_dir.mkdir(exist_ok=True)
-                xlsx_path = str(out_dir / f"donnees_{zone_slug}_{today}.xlsx")
-                docx_path = str(out_dir / f"synthese_{zone_slug}_{today}.docx")
-                zone_nom  = f"{dept_nom} ({dept_code})" if dept_nom else dept_code
-
-                with st.spinner("Génération du fichier Excel…"):
-                    generate_excel(
-                        output_path=xlsx_path, zone_nom=zone_nom,
-                        dept_code=dept_code, dept_nom=dept_nom, region=region,
-                        communes_data=results.get("insee", []),
-                        pj_data=results.get("pages_jaunes", []),
-                        maternites=maternites_flat,
-                        lactariums=results.get("lactariums", []),
-                        sages_femmes=results.get("sages_femmes", []),
-                        pmi=results.get("pmi", []),
-                    )
-                    st.session_state.xlsx_bytes = open(xlsx_path, "rb").read()
-
-                with st.spinner("Génération du document Word…"):
-                    generate_word(
-                        output_path=docx_path, zone_nom=zone_nom,
-                        dept_code=dept_code, dept_nom=dept_nom, region=region,
-                        communes=communes_flat,
-                        communes_data=results.get("insee", []),
-                        pj_data=results.get("pages_jaunes", []),
-                        maternites=maternites_flat,
-                        lactariums=results.get("lactariums", []),
-                        sages_femmes=results.get("sages_femmes", []),
-                        pmi=results.get("pmi", []),
-                    )
-                    st.session_state.docx_bytes = open(docx_path, "rb").read()
-
-                st.session_state.step = 4
-                st.session_state.collect_step = 1
-                st.rerun()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
