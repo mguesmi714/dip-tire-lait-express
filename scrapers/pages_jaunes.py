@@ -521,27 +521,5 @@ def get_pharmacies_and_medical(communes: list[dict]) -> list[dict]:
         return results
 
     except Exception as e:
-        print(f"[PJ] {e} — basculement total sur OSM+SIRENE")
-        # Try to retrieve totals from Pages Jaunes via HTTP to keep reported counts
-        pj_totals = {}
-        for c in communes:
-            nom = c.get("nom", "")
-            cp = c.get("cp", "")
-            ph_total = _pj_total_via_http("pharmacie", nom, cp)
-            mm_total = _pj_total_via_http("magasin materiel medical", nom, cp)
-            pj_totals[nom] = {"pharmacies": ph_total, "materiel_medical": mm_total}
-
-        osm_results = _scrape_osm_fallback(communes)
-        # Override counts with PJ totals when available, keep names/adresses from OSM/SIRENE
-        for r in osm_results:
-            nom = r.get("commune", "")
-            pj_t = pj_totals.get(nom, {})
-            if pj_t:
-                if pj_t.get("pharmacies"):
-                    r["nb_pharmacies"] = pj_t["pharmacies"]
-                if pj_t.get("materiel_medical"):
-                    r["nb_materiel_medical"] = pj_t["materiel_medical"]
-                # Annotate source to indicate counts taken from PJ while details from SIRENE
-                r["_source"] = r.get("_source", "") + f" (comptes PJ: ph={pj_t.get('pharmacies',0)}, mag={pj_t.get('materiel_medical',0)})"
-
-        return osm_results
+        print(f"[PJ] {e} — basculement OSM+SIRENE")
+        return _scrape_osm_fallback(communes)

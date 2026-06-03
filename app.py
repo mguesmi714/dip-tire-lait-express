@@ -7,14 +7,31 @@ import io
 import os
 import re
 import sys
+import json
+import hashlib
 import subprocess
 import concurrent.futures
 from pathlib import Path
-from datetime import date
+from datetime import date, datetime
 
 import requests
 import streamlit as st
 import pandas as pd
+
+try:
+    import folium
+    from streamlit_folium import st_folium
+    _FOLIUM_OK = True
+except ImportError:
+    _FOLIUM_OK = False
+
+try:
+    import plotly.express as px
+    import plotly.graph_objects as go
+    _PLOTLY_OK = True
+except ImportError:
+    _PLOTLY_OK = False
+
 
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -97,6 +114,162 @@ def _init():
             st.session_state[k] = v
 
 _init()
+
+
+# ── Cache résultats ───────────────────────────────────────────────────────────
+
+_CACHE_DIR = Path(__file__).parent / "output" / "cache"
+_CACHE_TTL_DAYS = 7
+
+
+def _zone_key(cp_uniques: list[str]) -> str:
+    return hashlib.md5("|".join(sorted(cp_uniques)).encode()).hexdigest()[:12]
+
+
+def _cache_path(key: str) -> Path:
+    _CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    return _CACHE_DIR / f"{key}.json"
+
+
+def _load_cache(cp_uniques: list[str]) -> tuple[dict, str] | tuple[None, None]:
+    path = _cache_path(_zone_key(cp_uniques))
+    if not path.exists():
+        return None, None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        saved = datetime.fromisoformat(data["_saved_at"])
+        if (datetime.now() - saved).days > _CACHE_TTL_DAYS:
+            return None, None
+        return data["results"], saved.strftime("%d/%m/%Y %H:%M")
+    except Exception:
+        return None, None
+
+
+def _save_cache(cp_uniques: list[str], results: dict) -> None:
+    try:
+        path = _cache_path(_zone_key(cp_uniques))
+        payload = {"_saved_at": datetime.now().isoformat(), "results": results}
+        path.write_text(json.dumps(payload, ensure_ascii=False, default=str), encoding="utf-8")
+    except Exception:
+        pass
+
+
+# ── Carte interactive ─────────────────────────────────────────────────────────
+
+@st.cache_data(ttl=3600)
+def _get_commune_centre(code_insee: str) -> tuple[float, float] | None:
+    try:
+        r = requests.get(
+            f"https://geo.api.gouv.fr/communes/{code_insee}?fields=centre",
+            timeout=5,
+        )
+        coords = r.json().get("centre", {}).get("coordinates")
+        if coords:
+            return coords[1], coords[0]  # lat, lon
+    except Exception:
+        pass
+    return None
+
+
+def _build_map(communes_flat, mat_data, sf_data, pmi_data):
+    if not _FOLIUM_OK:
+        return None
+    lats, lons = [], []
+    m = folium.Map(zoom_start=10, tiles="CartoDB positron")
+
+    # Communes (centroïdes)
+    for c in communes_flat:
+        cog = c.get("code_insee") or c.get("code", "")
+        if not cog:
+            continue
+        coords = _get_commune_centre(cog)
+        if not coords:
+            continue
+        lat, lon = coords
+        lats.append(lat); lons.append(lon)
+        folium.CircleMarker(
+            [lat, lon], radius=5, color="#1F4E79", fill=True, fill_opacity=0.6,
+            tooltip=f"{c.get('nom','')} ({c.get('cp','')})",
+        ).add_to(m)
+
+    # Maternités
+    if isinstance(mat_data, dict):
+        for cp, mats in mat_data.items():
+            for mat in mats:
+                ville = mat.get("ville", "")
+                if not ville:
+                    continue
+                try:
+                    r = requests.get(
+                        f"https://geo.api.gouv.fr/communes?nom={ville}&codePostal={cp}&fields=centre&limit=1",
+                        timeout=4,
+                    ).json()
+                    if r:
+                        coords = r[0].get("centre", {}).get("coordinates")
+                        if coords:
+                            lat, lon = coords[1], coords[0]
+                            lats.append(lat); lons.append(lon)
+                            folium.Marker(
+                                [lat, lon],
+                                icon=folium.Icon(color="red", icon="plus-sign"),
+                                tooltip=f"🏥 {mat.get('nom','')} — {mat.get('type_niveau','')}",
+                                popup=f"<b>{mat.get('nom','')}</b><br>{mat.get('statut','')} {mat.get('type_niveau','')}",
+                            ).add_to(m)
+                except Exception:
+                    pass
+
+    # Sages-femmes
+    for sf in sf_data:
+        cp_sf = sf.get("cp", "")
+        ville_sf = sf.get("ville", "")
+        if not cp_sf:
+            continue
+        try:
+            r = requests.get(
+                f"https://geo.api.gouv.fr/communes?codePostal={cp_sf}&fields=centre&limit=1",
+                timeout=4,
+            ).json()
+            if r:
+                coords = r[0].get("centre", {}).get("coordinates")
+                if coords:
+                    lat, lon = coords[1], coords[0]
+                    lats.append(lat); lons.append(lon)
+                    folium.CircleMarker(
+                        [lat, lon], radius=6, color="#2e7d32", fill=True, fill_opacity=0.8,
+                        tooltip=f"🤱 {sf.get('nom','')} {sf.get('prenom','')} — {ville_sf}",
+                    ).add_to(m)
+        except Exception:
+            pass
+
+    # PMI
+    for pmi in pmi_data:
+        cp_pmi = pmi.get("cp", "")
+        if not cp_pmi:
+            continue
+        try:
+            r = requests.get(
+                f"https://geo.api.gouv.fr/communes?codePostal={cp_pmi}&fields=centre&limit=1",
+                timeout=4,
+            ).json()
+            if r:
+                coords = r[0].get("centre", {}).get("coordinates")
+                if coords:
+                    lat, lon = coords[1], coords[0]
+                    lats.append(lat); lons.append(lon)
+                    folium.Marker(
+                        [lat, lon],
+                        icon=folium.Icon(color="orange", icon="baby"),
+                        tooltip=f"👶 {pmi.get('nom','')}",
+                    ).add_to(m)
+        except Exception:
+            pass
+
+    if lats and lons:
+        m.fit_bounds([[min(lats), min(lons)], [max(lats), max(lons)]])
+    return m
+
+
+
 
 
 # ── Inférer dept/région depuis les CP via geo.api.gouv.fr ────────────────────
@@ -397,6 +570,18 @@ elif st.session_state.step == 3:
 
     communes_par_cp = st.session_state.communes_par_cp
     cp_uniques      = st.session_state.cp_uniques
+
+    # ── Cache : proposer la réutilisation si données récentes ────────────────
+    cached_results, cached_date = _load_cache(cp_uniques)
+    if cached_results and not st.session_state.results:
+        st.info(f"💾 Données en cache disponibles du **{cached_date}** pour cette zone.")
+        col_cache_use, col_cache_skip = st.columns([1, 2])
+        with col_cache_use:
+            if st.button("⚡ Utiliser le cache", type="primary"):
+                st.session_state.results = cached_results
+                st.rerun()
+        with col_cache_skip:
+            st.caption("ou lancez les scrapers ci-dessous pour actualiser les données")
     dept_code       = st.session_state.dept_code
     dept_codes      = list(dict.fromkeys(
         cp[:3] if cp.startswith("97") else cp[:2]
@@ -422,10 +607,11 @@ elif st.session_state.step == 3:
 
     communes_pj = [
         {
-            "nom":       c["nom"],
-            "cp":        c.get("cp", ""),
-            "dept_code": (c.get("departement") or {}).get("code", "") or c.get("cp", "")[:2],
-            "dept_nom":  (c.get("departement") or {}).get("nom", ""),
+            "nom":        c["nom"],
+            "cp":         c.get("cp", ""),
+            "code_insee": c.get("code_insee") or c.get("code", ""),
+            "dept_code":  (c.get("departement") or {}).get("code", "") or c.get("cp", "")[:2],
+            "dept_nom":   (c.get("departement") or {}).get("nom", ""),
         }
         for c in communes_flat
     ]
@@ -463,7 +649,8 @@ elif st.session_state.step == 3:
             "label": "🤱 Sages-femmes",
             "desc":  "Ordre SF — sages-femmes libérales",
             "fn":    get_sages_femmes,
-            "args":  (dept_codes, cp_uniques),
+            "args":  (dept_codes, cp_uniques,
+                      [c["nom"] for c in communes_flat]),
         },
         {
             "key":   "pmi",
@@ -498,6 +685,25 @@ elif st.session_state.step == 3:
     # ── Cartes indépendantes ──────────────────────────────────────────────────
     st.subheader("⚙️ Étape 3 — Collecte des données")
     st.caption("Lancez chaque source indépendamment, dans n'importe quel ordre.")
+
+    # Bouton tout lancer
+    nb_done = sum(1 for s in COLLECT_STEPS if s["key"] in st.session_state.results)
+    if nb_done < len(COLLECT_STEPS):
+        if st.button("▶▶ Tout lancer d'un coup", use_container_width=False):
+            st.session_state["_launch_all"] = True
+            st.rerun()
+
+    # Lancer tous les scrapers d'un coup
+    if st.session_state.pop("_launch_all", False):
+        for step in COLLECT_STEPS:
+            if step["key"] not in st.session_state.results:
+                with st.spinner(f"{step['label']} en cours…"):
+                    try:
+                        st.session_state.results[step["key"]] = step["fn"](*step["args"])
+                    except Exception as e:
+                        st.session_state.results[step["key"]] = {} if step["key"] == "maternites" else []
+        _save_cache(cp_uniques, st.session_state.results)
+        st.rerun()
 
     card_cols = st.columns(3)
     for i, step in enumerate(COLLECT_STEPS):
@@ -666,6 +872,7 @@ elif st.session_state.step == 3:
                 )
                 st.session_state.docx_bytes = open(docx_path, "rb").read()
 
+            _save_cache(cp_uniques, st.session_state.results)
             st.session_state.step = 4
             st.rerun()
 
@@ -688,6 +895,14 @@ elif st.session_state.step == 4:
 
     zone_totals = compute_zone_totals(insee_data) if insee_data else {}
 
+    def _to_num(v):
+        if v is None:
+            return None
+        try:
+            return float(str(v).replace("\xa0", "").replace(" ", "").replace(",", "."))
+        except Exception:
+            return None
+
     def _kpi(key):
         v = zone_totals.get(key)
         if v is None:
@@ -708,43 +923,193 @@ elif st.session_state.step == 4:
 
     st.divider()
 
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
-        "🏘️ Communes", "💊 Pharmacies", "🏥 Maternités", "🤱 Sages-femmes", "🥛 Lactariums", "👶 PMI"
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
+        "📊 Tableau de bord", "🏘️ Communes", "💊 Pharmacies", "🏥 Maternités",
+        "🤱 Sages-femmes", "🥛 Lactariums", "👶 PMI", "🗺️ Carte",
     ])
 
+    # ── Tableau de bord ───────────────────────────────────────────────────────
     with tab1:
+        if not _PLOTLY_OK:
+            st.warning("Installez `plotly` pour afficher les graphiques.")
+        else:
+            # ── Ligne 1 : Population & Naissances ──────────────────────────
+            if insee_data:
+                df_insee = pd.DataFrame([
+                    {
+                        "Commune":       r.get("commune", ""),
+                        "Population":    _to_num(r.get("pop_2022")),
+                        "Naissances":    _to_num(r.get("naissances_2022")),
+                        "Taux pauvreté": _to_num(r.get("taux_pauvrete_2021")),
+                        "Taux chômage":  _to_num(r.get("taux_chomage_15_64_2022")),
+                        "Revenu médian": _to_num(r.get("mediane_revenu_2021")),
+                        "Densité":       _to_num(r.get("densite_2022")),
+                    }
+                    for r in insee_data if r.get("commune") != "TOTAL ZONE"
+                ]).dropna(subset=["Commune"])
+
+                col_a, col_b = st.columns(2)
+                with col_a:
+                    df_pop = df_insee.dropna(subset=["Population"]).sort_values("Population", ascending=True)
+                    if not df_pop.empty:
+                        fig = px.bar(df_pop, x="Population", y="Commune", orientation="h",
+                                     title="Population par commune (2022)",
+                                     color="Population", color_continuous_scale="Blues",
+                                     height=max(300, len(df_pop) * 28))
+                        fig.update_layout(showlegend=False, coloraxis_showscale=False, margin=dict(l=0, r=0, t=40, b=0))
+                        st.plotly_chart(fig, use_container_width=True)
+
+                with col_b:
+                    df_nais = df_insee.dropna(subset=["Naissances"]).sort_values("Naissances", ascending=True)
+                    if not df_nais.empty:
+                        fig = px.bar(df_nais, x="Naissances", y="Commune", orientation="h",
+                                     title="Naissances domiciliées (2022)",
+                                     color="Naissances", color_continuous_scale="Greens",
+                                     height=max(300, len(df_nais) * 28))
+                        fig.update_layout(showlegend=False, coloraxis_showscale=False, margin=dict(l=0, r=0, t=40, b=0))
+                        st.plotly_chart(fig, use_container_width=True)
+
+                # ── Ligne 2 : Revenus & Pauvreté ───────────────────────────
+                col_c, col_d = st.columns(2)
+                with col_c:
+                    df_rev = df_insee.dropna(subset=["Revenu médian"]).sort_values("Revenu médian", ascending=True)
+                    if not df_rev.empty:
+                        fig = px.bar(df_rev, x="Revenu médian", y="Commune", orientation="h",
+                                     title="Revenu disponible médian (€)",
+                                     color="Revenu médian", color_continuous_scale="Oranges",
+                                     height=max(300, len(df_rev) * 28))
+                        fig.update_layout(showlegend=False, coloraxis_showscale=False, margin=dict(l=0, r=0, t=40, b=0))
+                        st.plotly_chart(fig, use_container_width=True)
+
+                with col_d:
+                    df_pauv = df_insee.dropna(subset=["Taux pauvreté"]).sort_values("Taux pauvreté", ascending=False)
+                    if not df_pauv.empty:
+                        fig = px.bar(df_pauv, x="Taux pauvreté", y="Commune", orientation="h",
+                                     title="Taux de pauvreté (%)",
+                                     color="Taux pauvreté", color_continuous_scale="Reds",
+                                     height=max(300, len(df_pauv) * 28))
+                        fig.update_layout(showlegend=False, coloraxis_showscale=False, margin=dict(l=0, r=0, t=40, b=0))
+                        st.plotly_chart(fig, use_container_width=True)
+
+            st.divider()
+
+            # ── Ligne 3 : Offre de soins ────────────────────────────────────
+            col_e, col_f, col_g = st.columns(3)
+
+            with col_e:
+                # Maternités par niveau
+                if isinstance(mat_data, dict):
+                    niveaux_count: dict[str, int] = {}
+                    for cp, mats in mat_data.items():
+                        for m in mats:
+                            niv = m.get("type_niveau", "Non renseigné") or "Non renseigné"
+                            niveaux_count[niv] = niveaux_count.get(niv, 0) + 1
+                    if niveaux_count:
+                        fig = px.pie(
+                            names=list(niveaux_count.keys()),
+                            values=list(niveaux_count.values()),
+                            title="Maternités par niveau",
+                            color_discrete_sequence=px.colors.sequential.RdBu,
+                        )
+                        fig.update_layout(margin=dict(l=0, r=0, t=40, b=0))
+                        st.plotly_chart(fig, use_container_width=True)
+                    else:
+                        st.info("Aucune maternité")
+
+            with col_f:
+                # Statut public/privé
+                if isinstance(mat_data, dict):
+                    statuts: dict[str, int] = {}
+                    for cp, mats in mat_data.items():
+                        for m in mats:
+                            s = m.get("statut", "Non renseigné") or "Non renseigné"
+                            statuts[s] = statuts.get(s, 0) + 1
+                    if statuts:
+                        fig = px.pie(
+                            names=list(statuts.keys()),
+                            values=list(statuts.values()),
+                            title="Maternités public / privé",
+                            color_discrete_map={"Public": "#1F4E79", "Privé": "#e57373", "Non renseigné": "#aaa"},
+                        )
+                        fig.update_layout(margin=dict(l=0, r=0, t=40, b=0))
+                        st.plotly_chart(fig, use_container_width=True)
+
+            with col_g:
+                # Pharmacies par commune (top 10)
+                if pj_data:
+                    df_ph = pd.DataFrame([
+                        {"Commune": r.get("commune", ""), "Pharmacies": r.get("nb_pharmacies", 0)}
+                        for r in pj_data
+                    ]).sort_values("Pharmacies", ascending=False).head(10)
+                    if not df_ph.empty:
+                        fig = px.bar(df_ph, x="Commune", y="Pharmacies",
+                                     title="Pharmacies (top 10 communes)",
+                                     color="Pharmacies", color_continuous_scale="Purples")
+                        fig.update_layout(showlegend=False, coloraxis_showscale=False,
+                                          margin=dict(l=0, r=0, t=40, b=0), xaxis_tickangle=-45)
+                        st.plotly_chart(fig, use_container_width=True)
+
+            # ── Ligne 4 : Chômage ───────────────────────────────────────────
+            if insee_data:
+                df_chom = df_insee.dropna(subset=["Taux chômage"]).sort_values("Taux chômage", ascending=False)
+                if not df_chom.empty:
+                    fig = px.bar(df_chom, x="Commune", y="Taux chômage",
+                                 title="Taux de chômage 15-64 ans (%)",
+                                 color="Taux chômage", color_continuous_scale="YlOrRd")
+                    fig.update_layout(showlegend=False, coloraxis_showscale=False,
+                                      margin=dict(l=0, r=0, t=40, b=0), xaxis_tickangle=-45)
+                    st.plotly_chart(fig, use_container_width=True)
+
+    # ── Onglet Communes ───────────────────────────────────────────────────────
+    with tab2:
         if insee_data:
             st.dataframe(_build_insee_pivot(insee_data, st.session_state.get("communes_flat")), width='stretch', hide_index=True)
         else:
             st.warning("Données INSEE non récupérées — le site a peut-être bloqué la requête. Relancez la collecte.")
 
-    with tab2:
+    with tab3:
         if pj_data:
-            df = pd.DataFrame([{
-                "Commune":                    r.get("commune", ""),
-                "CP":                         r.get("cp", ""),
-                "Pharmacies":                 r.get("nb_pharmacies", 0),
-                "Noms pharmacies":            "\n".join(
-                    f"{n} — {a}" if a else n
-                    for n, a in zip(
-                        r.get("noms_pharmacies", [])[:5],
-                        r.get("adresses_pharmacies", [])[:5] + [""] * 5
-                    )
-                ),
-                "Magasin matériel médical":   r.get("nb_materiel_medical", 0),
-                "Noms matériel médical":      "\n".join(
-                    f"{n} — {a}" if a else n
-                    for n, a in zip(
-                        r.get("noms_materiel_medical", [])[:5],
-                        r.get("adresses_materiel_medical", [])[:5] + [""] * 5
-                    )
-                ),
+            st.caption("✏️ Les colonnes **Pharmacies** et **Matériel médical** sont modifiables — double-cliquez sur une cellule pour corriger.")
+            df_edit = pd.DataFrame([{
+                "Commune":            r.get("commune", ""),
+                "CP":                 r.get("cp", ""),
+                "Pharmacies":         int(r.get("nb_pharmacies", 0)),
+                "Matériel médical":   int(r.get("nb_materiel_medical", 0)),
+                "Noms pharmacies":    " | ".join(r.get("noms_pharmacies", [])[:5]),
+                "Noms mat. médical":  " | ".join(r.get("noms_materiel_medical", [])[:5]),
             } for r in pj_data])
-            st.dataframe(df, width='stretch', hide_index=True)
+
+            edited = st.data_editor(
+                df_edit,
+                column_config={
+                    "Commune":           st.column_config.TextColumn(disabled=True),
+                    "CP":                st.column_config.TextColumn(disabled=True),
+                    "Pharmacies":        st.column_config.NumberColumn(min_value=0, step=1),
+                    "Matériel médical":  st.column_config.NumberColumn(min_value=0, step=1),
+                    "Noms pharmacies":   st.column_config.TextColumn(disabled=True),
+                    "Noms mat. médical": st.column_config.TextColumn(disabled=True),
+                },
+                hide_index=True,
+                use_container_width=True,
+                key="pj_editor",
+            )
+
+            if st.button("💾 Sauvegarder les modifications"):
+                pj_updated = st.session_state.results.get("pages_jaunes", [])
+                for _, row in edited.iterrows():
+                    commune = row["Commune"]
+                    for r in pj_updated:
+                        if r.get("commune") == commune:
+                            r["nb_pharmacies"]    = int(row["Pharmacies"])
+                            r["nb_materiel_medical"] = int(row["Matériel médical"])
+                            break
+                st.session_state.results["pages_jaunes"] = pj_updated
+                st.success("Modifications sauvegardées.")
+                st.rerun()
         else:
             st.warning("Données Pages Jaunes non récupérées.")
 
-    with tab3:
+    with tab4:
         rows_mat = []
         if isinstance(mat_data, dict):
             for cp, mats in mat_data.items():
@@ -768,7 +1133,7 @@ elif st.session_state.step == 4:
         else:
             st.warning("Aucune maternité trouvée.")
 
-    with tab4:
+    with tab5:
         if sf_data:
             df = pd.DataFrame([{
                 "Nom":       f"{r.get('nom','')} {r.get('prenom','')}".strip(),
@@ -781,7 +1146,7 @@ elif st.session_state.step == 4:
         else:
             st.warning("Aucune sage-femme trouvée.")
 
-    with tab5:
+    with tab6:
         if lac_data:
             df = pd.DataFrame([{
                 "Nom":         r.get("nom", ""),
@@ -792,7 +1157,7 @@ elif st.session_state.step == 4:
         else:
             st.warning("Aucun lactarium trouvé.")
 
-    with tab6:
+    with tab7:
         if pmi_data:
             df = pd.DataFrame([{
                 "Nom":       r.get("nom", ""),
@@ -805,6 +1170,23 @@ elif st.session_state.step == 4:
             st.dataframe(df, width='stretch', hide_index=True)
         else:
             st.warning("Aucune PMI trouvée.")
+
+    # ── Carte interactive ─────────────────────────────────────────────────────
+    with tab8:
+        if not _FOLIUM_OK:
+            st.warning("Installez `folium` et `streamlit-folium` pour afficher la carte.")
+        else:
+            communes_flat_map = st.session_state.get("communes_flat", [])
+            if "_carte" not in st.session_state:
+                with st.spinner("Chargement de la carte…"):
+                    st.session_state["_carte"] = _build_map(communes_flat_map, mat_data, sf_data, pmi_data)
+            fmap = st.session_state["_carte"]
+            if fmap:
+                st.caption("🔵 Communes · 🔴 Maternités · 🟢 Sages-femmes · 🟠 PMI")
+                st_folium(fmap, use_container_width=True, height=520, returned_objects=[])
+            else:
+                st.info("Aucune donnée géolocalisable disponible.")
+
 
     st.divider()
     if st.button("📥 Télécharger les fichiers →", type="primary"):

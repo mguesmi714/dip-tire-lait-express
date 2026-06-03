@@ -13,6 +13,7 @@ Logique :
 
 import re
 import time
+import unicodedata
 import requests
 from bs4 import BeautifulSoup
 
@@ -93,26 +94,33 @@ def _parse_page(soup: BeautifulSoup, dept: str) -> list[dict]:
     return sfs
 
 
-def get_sages_femmes(dept_codes, cp_list=None) -> list[dict]:
+def _norm(s: str) -> str:
+    """Normalise un nom de commune pour comparaison (sans accents, majuscule)."""
+    s = s.upper().strip()
+    s = "".join(
+        c for c in unicodedata.normalize("NFD", s)
+        if unicodedata.category(c) != "Mn"
+    )
+    return re.sub(r"[\s\-']+", " ", s).strip()
+
+
+def get_sages_femmes(dept_codes, cp_list=None,
+                     communes_noms=None) -> list[dict]:
     """
     Scrappe les sages-femmes pour les departements donnes,
-    filtrees sur les codes postaux de la zone si cp_list est fourni.
+    filtrees sur les codes postaux OU les noms de communes de la zone.
 
     Args:
-        dept_codes : str ou list[str] — ex. "56" ou ["56", "29"]
-        cp_list    : list[str] optionnel — ex. ["56000", "56190"]
-                     Si fourni, seules les SF dont le CP est dans cp_list
-                     sont retournees.
-
-    Returns:
-        Liste de dicts dedoublonnes. Si une SF travaille dans 2 CP de la zone,
-        elle apparait une seule fois avec tous ses CP cumules.
+        dept_codes    : str ou list[str]
+        cp_list       : list[str] optionnel — ex. ["56000", "56190"]
+        communes_noms : list[str] optionnel — noms des communes de la zone
+                        Permet de capturer les SF dont le CP diffère de cp_list.
     """
     if isinstance(dept_codes, str):
         dept_codes = [dept_codes]
 
-    # Normaliser cp_list en ensemble pour la comparaison
-    cp_set = set(cp_list) if cp_list else None
+    cp_set     = set(cp_list)       if cp_list       else None
+    comm_set   = {_norm(n) for n in communes_noms if n} if communes_noms else None
 
     source_date = time.strftime("%d/%m/%Y")
     seen: dict[str, dict] = {}   # cle : "NOM PRENOM" majuscule
@@ -132,17 +140,27 @@ def get_sages_femmes(dept_codes, cp_list=None) -> list[dict]:
         print(f"[SF] Dept {dept}: {len(sfs)} sages-femmes trouvees au total")
 
         for sf in sfs:
-            # Filtrer par code postal si demande
-            if cp_set and sf["cp"] not in cp_set:
-                continue
+            # Filtrer : CP exact OU nom de commune dans la zone
+            if cp_set is None and comm_set is None:
+                pass   # aucun filtre : inclure toutes les SF
+            else:
+                cp_ok    = cp_set   is not None and sf["cp"] in cp_set
+                ville_ok = comm_set is not None and _norm(sf.get("ville", "")) in comm_set
+                if not (cp_ok or ville_ok):
+                    continue
 
             key = f"{sf['nom']} {sf['prenom']}".strip().upper()
             if key in seen:
-                # SF deja vue avec un autre CP de la zone -> cumuler
-                cp_val = sf["cp"]
+                # SF deja vue -> cumuler adresse et CP si nouveaux
+                cp_val  = sf["cp"]
+                adr_val = sf["adresse"]
                 if cp_val and cp_val not in seen[key]["code_postaux"]:
                     seen[key]["code_postaux"].append(cp_val)
-                    seen[key]["adresses_secondaires"].append(sf["adresse"])
+                # Ajouter l'adresse secondaire même si le CP est identique
+                # (même personne, deux cabinets distincts)
+                if adr_val and adr_val not in seen[key]["adresses_secondaires"] \
+                        and adr_val != seen[key].get("adresse", ""):
+                    seen[key]["adresses_secondaires"].append(adr_val)
             else:
                 seen[key] = {
                     **sf,
