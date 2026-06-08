@@ -18,6 +18,23 @@ from config import HEADERS, REQUEST_DELAY
 _DEPT_PAGE  = "https://www.annuaire-administration.com/code-postal/departement/{slug}.html"
 _GEO_DEPT   = "https://geo.api.gouv.fr/departements/{code}?fields=nom"
 _GEO_CP     = "https://geo.api.gouv.fr/communes?codePostal={cp}&fields=nom,code,departement,region&format=json"
+_GEO_COG    = "https://geo.api.gouv.fr/communes/{cog}?fields=nom,code,departement,region"
+
+
+def _arrond_cog(cp: str) -> str | None:
+    """
+    Pour les CP d'arrondissements (Marseille 13001-13016, Paris 75001-75020, Lyon 69001-69009),
+    geo.api.gouv.fr retourne le code de la commune principale (13055, 75056, 69123) au lieu
+    du code COG de l'arrondissement (13201-13216, 75101-75120, 69381-69389).
+    Cette fonction retourne le vrai code COG, ou None si le CP n'est pas un arrondissement.
+    """
+    if re.match(r"^130(0[1-9]|1[0-6])$", cp):    # Marseille 1er–16e
+        return f"132{cp[3:]}"                      # 13001→13201, 13016→13216
+    if re.match(r"^750(0[1-9]|1[0-9]|20)$", cp): # Paris 1er–20e
+        return f"751{cp[3:]}"                      # 75001→75101, 75020→75120
+    if re.match(r"^690(0[1-9])$", cp):            # Lyon 1er–9e
+        return str(int(cp) + 380)                  # 69001→69381, 69009→69389
+    return None
 
 # Cache des pages département pour ne pas les télécharger plusieurs fois
 _dept_cache: dict[str, dict[str, list[str]]] = {}   # {dept_code: {cp: [noms]}}
@@ -161,6 +178,24 @@ def get_communes_for_cp(cp: str) -> list[dict]:
                     print(f"[COMMUNES] {cp} résolu comme code INSEE → {c.get('nom')}")
         except Exception:
             pass
+
+    # 2c. Arrondissements Marseille / Paris / Lyon :
+    # geo.api retourne le code de la commune principale (ex. 13055) alors que le vrai COG
+    # de l'arrondissement est différent (ex. 13216 pour Marseille 16e).
+    # On corrige en récupérant directement les données de l'arrondissement.
+    arrond_cog = _arrond_cog(cp)
+    if arrond_cog:
+        try:
+            r_arr = requests.get(_GEO_COG.format(cog=arrond_cog), timeout=10)
+            if r_arr.status_code == 200:
+                arr_data = r_arr.json()
+                if arr_data.get("code"):
+                    geo_data = [arr_data]
+                    print(f"[COMMUNES] {cp} → arrondissement {arrond_cog} : {arr_data.get('nom')}")
+        except Exception:
+            # Fallback : garder geo_data existant en corrigeant juste le code
+            for c in geo_data:
+                c["code"] = arrond_cog
 
     # Index geo par nom normalisé → pour retrouver le code INSEE
     geo_by_norm: dict[str, dict] = {

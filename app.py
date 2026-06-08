@@ -56,7 +56,7 @@ _install_playwright_chromium()
 
 from scrapers.communes import get_communes_for_all_cp
 from scrapers.insee import get_all_communes_data, compute_zone_totals
-from scrapers.pages_jaunes import get_pharmacies_and_medical
+from scrapers.annuaire_pharmacies import get_pharmacies_and_medical
 from scrapers.maternites import get_maternites_par_cp
 from scrapers.lactariums import get_lactariums
 from scrapers.sages_femmes import get_sages_femmes
@@ -662,7 +662,7 @@ elif st.session_state.step == 3:
         {
             "key":   "pages_jaunes",
             "label": "💊 Pharmacies",
-            "desc":  "Pages Jaunes — pharmacies & matériel médical",
+            "desc":  "Annuaire des Pharmacies + SIRENE — pharmacies & matériel médical",
             "fn":    get_pharmacies_and_medical,
             "args":  (communes_pj,),
         },
