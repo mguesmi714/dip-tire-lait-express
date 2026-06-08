@@ -35,6 +35,9 @@ except ImportError:
 
 sys.path.insert(0, str(Path(__file__).parent))
 
+from auth import is_authenticated, get_current_user, logout, show_login_page
+from dip_store import save_dip, list_dips, load_dip, load_dip_results
+
 
 @st.cache_resource
 def _install_playwright_chromium():
@@ -71,7 +74,7 @@ st.set_page_config(
     page_title="Mise à jour DIP — Tire-Lait Express",
     page_icon="👶",
     layout="wide",
-    initial_sidebar_state="collapsed",
+    initial_sidebar_state="expanded",
 )
 
 st.markdown("""
@@ -87,7 +90,22 @@ st.markdown("""
         border-radius:50%; width:28px; height:28px; text-align:center;
         line-height:28px; margin-right:8px;
     }
-    [data-testid="stSidebar"] { display: none; }
+    /* Sidebar à droite */
+    section[data-testid="stSidebar"] {
+        position: fixed; right: 0; left: auto !important;
+        border-left: 1px solid #e0e0e0; border-right: none;
+    }
+    .block-container { padding-right: 1rem; }
+    /* Cartes DIP */
+    .dip-card {
+        background: #f8faff; border: 1px solid #d0dff5;
+        border-radius: 10px; padding: 12px 14px; margin-bottom: 10px;
+        cursor: pointer;
+    }
+    .dip-card:hover { background: #e8f0ff; }
+    .dip-zone { font-weight: 700; color: #1F4E79; font-size: 0.95rem; }
+    .dip-meta { color: #666; font-size: 0.78rem; margin-top: 2px; }
+    .dip-legacy { color: #999; font-size: 0.73rem; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -97,7 +115,7 @@ st.markdown("""
 def _init():
     defaults = {
         "step": 1,
-        "collect_step": 1,   # sous-étape de collecte (1=maternités … 6=PMI)
+        "collect_step": 1,
         "cp_uniques": [],
         "communes_par_cp": {},
         "dept_code": "",
@@ -108,12 +126,76 @@ def _init():
         "communes_flat": [],
         "xlsx_bytes": None,
         "docx_bytes": None,
+        # Navigation
+        "page":        "dashboard",  # "dashboard" | "wizard" | "view_dip"
+        "view_dip_id": None,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
             st.session_state[k] = v
 
 _init()
+
+
+# ── Garde login ───────────────────────────────────────────────────────────────
+
+if not is_authenticated():
+    show_login_page()
+    st.stop()
+
+
+# ── Sidebar (panneau DIPs — affiché à droite via CSS) ─────────────────────────
+
+def _reset_wizard():
+    for key in ["step","collect_step","cp_uniques","communes_par_cp",
+                "dept_code","dept_codes","dept_nom","region","results",
+                "communes_flat","xlsx_bytes","docx_bytes","_carte"]:
+        if key in st.session_state:
+            del st.session_state[key]
+    _init()
+    st.session_state.page = "wizard"
+
+
+def _sidebar():
+    with st.sidebar:
+        st.markdown(f"**👤 {get_current_user()}**")
+        if st.button("🚪 Déconnexion", use_container_width=True):
+            logout()
+            st.rerun()
+
+        st.divider()
+
+        if st.button("➕ Nouveau DIP", type="primary", use_container_width=True):
+            _reset_wizard()
+            st.rerun()
+
+        if st.button("🏠 Tableau de bord", use_container_width=True):
+            st.session_state.page = "dashboard"
+            st.rerun()
+
+        st.divider()
+        st.markdown("**📁 DIPs récents**")
+
+        dips = list_dips()
+        if not dips:
+            st.caption("Aucun DIP enregistré.")
+        for dip in dips[:15]:
+            date_str = dip.get("created_at", "")[:10]
+            zone = dip.get("zone_nom") or dip.get("dept_nom", "?")
+            nb   = dip.get("nb_communes", "–")
+            is_legacy = dip.get("legacy", False)
+
+            label = f"{'📄' if is_legacy else '📊'} {zone[:22]}\n{date_str}"
+            if st.button(label, key=f"dip_{dip['id']}", use_container_width=True):
+                if is_legacy:
+                    st.session_state.page      = "view_dip"
+                    st.session_state.view_dip_id = dip["id"]
+                else:
+                    st.session_state.page      = "view_dip"
+                    st.session_state.view_dip_id = dip["id"]
+                st.rerun()
+
+_sidebar()
 
 
 # ── Cache résultats ───────────────────────────────────────────────────────────
@@ -416,6 +498,181 @@ def _dl_button(df: pd.DataFrame, label: str, filename: str) -> None:
         file_name=f"{filename}_{today}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PAGE : TABLEAU DE BORD
+# ══════════════════════════════════════════════════════════════════════════════
+
+if st.session_state.page == "dashboard":
+    st.title("👶 DIP Tire-Lait Express")
+    st.caption(f"Bienvenue **{get_current_user()}** — Dossiers d'Information Périnatale")
+    st.divider()
+
+    dips = list_dips()
+    col_new, col_stat1, col_stat2 = st.columns([2, 1, 1])
+    with col_new:
+        if st.button("➕ Créer un nouveau DIP", type="primary", use_container_width=True):
+            _reset_wizard()
+            st.rerun()
+    with col_stat1:
+        st.metric("DIPs créés", len(dips))
+    with col_stat2:
+        from datetime import timedelta
+        recent = sum(
+            1 for d in dips
+            if d.get("created_at", "")[:10] >= (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
+        )
+        st.metric("Cette semaine", recent)
+
+    st.divider()
+    st.subheader("📋 Tous les DIPs")
+
+    if not dips:
+        st.info("Aucun DIP enregistré. Créez votre premier DIP !")
+    else:
+        # Tableau
+        rows = []
+        for dip in dips:
+            rows.append({
+                "Zone":       dip.get("zone_nom") or dip.get("dept_nom", "?"),
+                "Département": dip.get("dept_nom", ""),
+                "Date":       dip.get("created_at", "")[:10],
+                "Communes":   dip.get("nb_communes", "–"),
+                "Créé par":   dip.get("created_by", ""),
+                "_id":        dip.get("id"),
+                "_legacy":    dip.get("legacy", False),
+            })
+        df_dips = pd.DataFrame(rows)
+
+        # Affichage avec boutons Consulter
+        for i, row in df_dips.iterrows():
+            c1, c2, c3, c4, c5, c6 = st.columns([2.5, 2, 1.5, 1, 1.5, 1.5])
+            c1.write(f"**{row['Zone']}**")
+            c2.write(row["Département"])
+            c3.write(row["Date"])
+            c4.write(str(row["Communes"]))
+            c5.write(row["Créé par"])
+            btn_label = "📥 Fichiers" if row["_legacy"] else "🔍 Consulter"
+            if c6.button(btn_label, key=f"view_{row['_id']}"):
+                st.session_state.page        = "view_dip"
+                st.session_state.view_dip_id = row["_id"]
+                st.rerun()
+
+    st.stop()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PAGE : CONSULTATION D'UN DIP PASSÉ
+# ══════════════════════════════════════════════════════════════════════════════
+
+if st.session_state.page == "view_dip":
+    dip_id = st.session_state.get("view_dip_id")
+    dip    = load_dip(dip_id) if dip_id else None
+
+    if not dip:
+        st.error("DIP introuvable.")
+        if st.button("← Retour"):
+            st.session_state.page = "dashboard"
+            st.rerun()
+        st.stop()
+
+    zone_nom  = dip.get("zone_nom") or dip.get("dept_nom", "?")
+    st.title(f"📊 DIP — {zone_nom}")
+    st.caption(f"Créé le {dip.get('created_at','')[:10]}  ·  {dip.get('nb_communes','?')} commune(s)")
+
+    col_ret, col_dl1, col_dl2 = st.columns([2, 2, 2])
+    with col_ret:
+        if st.button("← Tableau de bord"):
+            st.session_state.page = "dashboard"
+            st.rerun()
+
+    # Téléchargements
+    xlsx_path = Path(__file__).parent / "output" / dip.get("xlsx_filename", "")
+    docx_path = Path(__file__).parent / "output" / dip.get("docx_filename", "")
+    with col_dl1:
+        if xlsx_path.exists():
+            st.download_button("⬇️ Excel", xlsx_path.read_bytes(),
+                               file_name=xlsx_path.name,
+                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                               use_container_width=True)
+        else:
+            st.caption("Excel non disponible")
+    with col_dl2:
+        if docx_path.exists():
+            st.download_button("⬇️ Word", docx_path.read_bytes(),
+                               file_name=docx_path.name,
+                               mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                               use_container_width=True)
+        else:
+            st.caption("Word non disponible")
+
+    st.divider()
+
+    # Résultats interactifs si cache disponible
+    cache_key = dip.get("cache_key")
+    if cache_key:
+        results = load_dip_results(cache_key)
+        if results:
+            communes_list = dip.get("communes_list", [])
+            dept_code = dip.get("dept_code", "")
+            dept_nom  = dip.get("dept_nom", "")
+            region    = dip.get("region", "")
+            insee_data = results.get("insee", [])
+            pj_data    = results.get("pages_jaunes", results.get("annuaire_pharmacies", []))
+
+            tab_insee, tab_ph, tab_mat = st.tabs(["📊 INSEE", "💊 Pharmacies", "🏥 Maternités"])
+
+            with tab_insee:
+                if insee_data:
+                    st.dataframe(
+                        _build_insee_pivot(insee_data, communes_list or None),
+                        use_container_width=True, hide_index=True
+                    )
+                else:
+                    st.info("Données INSEE non disponibles dans ce DIP.")
+
+            with tab_ph:
+                if pj_data:
+                    df_ph = pd.DataFrame([{
+                        "Commune": r.get("commune",""), "CP": r.get("cp",""),
+                        "Pharmacies": r.get("nb_pharmacies",0),
+                        "Mat. médical": r.get("nb_materiel_medical",0),
+                    } for r in pj_data])
+                    st.dataframe(df_ph, use_container_width=True, hide_index=True)
+                else:
+                    st.info("Données pharmacies non disponibles dans ce DIP.")
+
+            with tab_mat:
+                mat_data = results.get("maternites", {})
+                if mat_data:
+                    rows_mat = []
+                    for cp, mats in (mat_data.items() if isinstance(mat_data, dict) else {}.items()):
+                        for m in mats:
+                            rows_mat.append({"CP": cp, "Maternité": m.get("nom",""),
+                                             "Niveau": m.get("type_niveau",""),
+                                             "Ville": m.get("ville","")})
+                    if rows_mat:
+                        st.dataframe(pd.DataFrame(rows_mat), use_container_width=True, hide_index=True)
+                    else:
+                        st.info("Aucune maternité.")
+                else:
+                    st.info("Données maternités non disponibles dans ce DIP.")
+        else:
+            st.warning("Cache de résultats expiré ou supprimé — seuls les fichiers sont disponibles.")
+    else:
+        st.info("Ce DIP est un fichier legacy — consultation des données non disponible.")
+
+    st.stop()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PAGE : WIZARD (nouveau DIP) — redirige vers dashboard si page != "wizard"
+# ══════════════════════════════════════════════════════════════════════════════
+
+if st.session_state.page not in ("wizard", None):
+    st.session_state.page = "dashboard"
+    st.rerun()
 
 
 # ── Header ────────────────────────────────────────────────────────────────────
@@ -873,6 +1130,30 @@ elif st.session_state.step == 3:
                 st.session_state.docx_bytes = open(docx_path, "rb").read()
 
             _save_cache(cp_uniques, st.session_state.results)
+
+            # Enregistrer le DIP dans l'index pour consultation future
+            cache_key = _zone_key(cp_uniques)
+            save_dip({
+                "id":           cache_key,
+                "zone_nom":     zone_nom,
+                "dept_nom":     dept_nom,
+                "dept_code":    dept_code,
+                "region":       region,
+                "cp_uniques":   cp_uniques,
+                "nb_communes":  len(communes_flat),
+                "created_at":   datetime.now().isoformat(),
+                "created_by":   get_current_user(),
+                "cache_key":    cache_key,
+                "xlsx_filename": Path(xlsx_path).name,
+                "docx_filename": Path(docx_path).name,
+                "communes_list": [
+                    {"nom": c.get("nom",""), "cp": c.get("cp",""),
+                     "code_insee": c.get("code_insee","")}
+                    for c in communes_flat
+                ],
+            })
+
+            st.session_state.page = "wizard"
             st.session_state.step = 4
             st.rerun()
 
@@ -1239,7 +1520,12 @@ elif st.session_state.step == 5:
     """)
 
     st.divider()
-    if st.button("🔄 Nouveau DIP", type="secondary"):
-        for key in list(st.session_state.keys()):
-            del st.session_state[key]
-        st.rerun()
+    col_nd, col_tb = st.columns(2)
+    with col_nd:
+        if st.button("➕ Nouveau DIP", type="primary", use_container_width=True):
+            _reset_wizard()
+            st.rerun()
+    with col_tb:
+        if st.button("🏠 Tableau de bord", use_container_width=True):
+            st.session_state.page = "dashboard"
+            st.rerun()
