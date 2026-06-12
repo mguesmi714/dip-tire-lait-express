@@ -304,6 +304,11 @@ def get_pmi(departement_code: str, departement_nom: str,
         if cp_set and pmi.get("cp") and pmi["cp"] not in cp_set:
             print(f"[PMI] Ignore (CP {pmi['cp']} hors zone) : {pmi['nom']}")
             continue
+        # Exclure les bus/camions France Services (services mobiles, pas des PMI)
+        _nom_up = pmi.get("nom", "").upper()
+        if "BUS " in _nom_up or "BUS FRANCE" in _nom_up or "CAMION" in _nom_up:
+            print(f"[PMI] Ignore (service mobile) : {pmi['nom']}")
+            continue
         # Dedoublonnage : meme adresse physique = meme rue + CP
         dedup_key = (pmi.get("rue", "").lower().strip(), pmi.get("cp", ""))
         if dedup_key[0] and dedup_key in seen_keys:

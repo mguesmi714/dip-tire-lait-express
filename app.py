@@ -639,7 +639,17 @@ if st.session_state.page == "view_dip":
                         "Pharmacies": r.get("nb_pharmacies",0),
                         "Mat. médical": r.get("nb_materiel_medical",0),
                     } for r in pj_data])
-                    st.dataframe(df_ph, use_container_width=True, hide_index=True)
+                    total_ph = pd.DataFrame([{
+                        "Commune": "TOTAL ZONE", "CP": "",
+                        "Pharmacies": df_ph["Pharmacies"].sum(),
+                        "Mat. médical": df_ph["Mat. médical"].sum(),
+                    }])
+                    df_ph_full = pd.concat([df_ph, total_ph], ignore_index=True)
+                    def _style_total_ph(row):
+                        if row["Commune"] == "TOTAL ZONE":
+                            return ["background-color:#1F4E79;color:white;font-weight:bold"] * len(row)
+                        return [""] * len(row)
+                    st.dataframe(df_ph_full.style.apply(_style_total_ph, axis=1), use_container_width=True, hide_index=True)
                 else:
                     st.info("Données pharmacies non disponibles dans ce DIP.")
 
@@ -1030,7 +1040,19 @@ elif st.session_state.step == 3:
                         "Nb mat. médical": r.get("nb_materiel_medical",0),
                         "Noms mat. médical": " | ".join(r.get("noms_materiel_medical",[])),
                     } for r in data])
-                    st.dataframe(df_pj[["Commune","CP","Nb pharmacies","Nb mat. médical"]], use_container_width=True, hide_index=True)
+                    # Ligne total
+                    df_display = df_pj[["Commune","CP","Nb pharmacies","Nb mat. médical"]].copy()
+                    total_row = pd.DataFrame([{
+                        "Commune": "TOTAL ZONE", "CP": "",
+                        "Nb pharmacies": df_display["Nb pharmacies"].sum(),
+                        "Nb mat. médical": df_display["Nb mat. médical"].sum(),
+                    }])
+                    df_display = pd.concat([df_display, total_row], ignore_index=True)
+                    def _style_total_pj(row):
+                        if row["Commune"] == "TOTAL ZONE":
+                            return ["background-color:#1F4E79;color:white;font-weight:bold"] * len(row)
+                        return [""] * len(row)
+                    st.dataframe(df_display.style.apply(_style_total_pj, axis=1), use_container_width=True, hide_index=True)
                     _dl_button(df_pj, "Pharmacies & Matériel médical", "pharmacies_mm")
                 else:
                     st.warning("Aucune donnée Pages Jaunes récupérée.")
