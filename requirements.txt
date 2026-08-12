@@ -6,7 +6,8 @@ rich>=13.0
 streamlit>=1.35
 # starlette 1.4.0 ajoute thread_minimum_size (obligatoire) a GZipResponder.__init__,
 # que streamlit ne passe pas -> TypeError au demarrage. A relever quand streamlit corrigera.
-starlette<1.4
+# Borne basse : DEFAULT_EXCLUDED_CONTENT_TYPES / IdentityResponder n'existent qu'a partir de 0.46.
+starlette>=0.46,<1.4
 playwright>=1.40
 camoufox>=0.4
 folium>=0.17
