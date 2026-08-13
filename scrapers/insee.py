@@ -25,6 +25,10 @@ _MAX_COMMUNES_PER_REQUEST = 20   # limite prudente pour l'URL
  
 # ── Mapping label court → clé normalisée ─────────────────────────────────────
  
+#
+# NB : les années présentes dans les patterns ne servent que de documentation.
+# _match_label() les neutralise (voir _norm_label) car l'INSEE change de millésime
+# chaque année : « Population en 2022 » est devenue « Population en 2023 ».
 LABEL_MAP = {
     # Population
     "population en 2022":                                               "pop_2022",
@@ -51,6 +55,7 @@ LABEL_MAP = {
     "part des ménages fiscaux imposés":                                 "part_menages_imposes_2021",
     # Emploi
     "emploi total (salarié et non salarié)":                            "emploi_total_2022",
+    "nombre d'emplois au lieu de travail":                              "emploi_total_2022",
     "dont part de l'emploi salarié":                                    "part_emploi_salarie_2022",
     "variation de l'emploi total au lieu de t":                         "var_emploi_2016_2022",
     "taux d'activité des 15 à 64 ans en 2022":                          "taux_activite_15_64_2022",
@@ -69,11 +74,25 @@ LABEL_MAP = {
 }
  
  
+_YEAR_RE = re.compile(r"\b(?:19|20)\d{2}\b")
+
+
+def _norm_label(s: str) -> str:
+    """Minuscules + années remplacées par un joker.
+
+    Le comparateur INSEE renomme ses libellés à chaque millésime
+    (« Population en 2022 » → « Population en 2023 »). Neutraliser l'année
+    évite de devoir repatcher LABEL_MAP tous les ans.
+    """
+    return _YEAR_RE.sub("@", s.lower().strip())
+
+
 def _match_label(label: str) -> str | None:
     """Retourne la clé normalisée pour un label INSEE (correspondance partielle)."""
-    label_lower = label.lower().strip()
+    label_norm = _norm_label(label)
     for pattern, key in LABEL_MAP.items():
-        if label_lower.startswith(pattern.lower()) or pattern.lower() in label_lower:
+        pattern_norm = _norm_label(pattern)
+        if label_norm.startswith(pattern_norm) or pattern_norm in label_norm:
             return key
     return None
  
@@ -123,8 +142,12 @@ def _search_add_commune(page, nom: str, cog: str) -> bool:
     return False
  
  
-def _extract_tables(page, results: dict) -> None:
-    """Extrait les données des tableaux comparatifs et remplit results."""
+def _extract_tables(page, results: dict, unmatched: set | None = None) -> None:
+    """Extrait les données des tableaux comparatifs et remplit results.
+
+    unmatched : set optionnel où sont collectés les libellés non reconnus, pour
+    détecter rapidement un renommage côté INSEE.
+    """
     tables = page.query_selector_all("table")
     for table in tables:
         rows = table.query_selector_all("tr")
@@ -144,6 +167,15 @@ def _extract_tables(page, results: dict) -> None:
             label = cells[0].inner_text().strip()
             key = _match_label(label)
             if not key:
+                # Ligne de données non reconnue → probable renommage INSEE.
+                # On ignore les lignes de bas de tableau (sources, champ, notes).
+                if (
+                    unmatched is not None
+                    and label
+                    and len(cells) > 1
+                    and not label.lower().startswith(("source", "champ", "avertissement", "note"))
+                ):
+                    unmatched.add(label)
                 continue
             for col_idx, cog in col_to_cog.items():
                 if col_idx < len(cells):
@@ -216,7 +248,8 @@ def _scrape_batch(communes_batch: list[dict]) -> dict[str, dict]:
                 time.sleep(3)
 
             # Première extraction via les tableaux déjà présents
-            _extract_tables(page, results)
+            unmatched: set[str] = set()
+            _extract_tables(page, results, unmatched)
 
             # Pour les communes sans données → recherche par nom dans le comparateur
             for cog in cog_codes:
@@ -230,7 +263,12 @@ def _scrape_batch(communes_batch: list[dict]) -> dict[str, dict]:
                                 page.wait_for_load_state("networkidle", timeout=15000)
                             except Exception:
                                 time.sleep(3)
-                            _extract_tables(page, results)
+                            _extract_tables(page, results, unmatched)
+
+            if unmatched:
+                print("[INSEE] Libellés non reconnus (LABEL_MAP à mettre à jour ?) :")
+                for lbl in sorted(unmatched):
+                    print(f"        - {lbl}")
 
             context.close()
             browser.close()
@@ -329,6 +367,15 @@ def get_all_communes_data(communes: list[dict]) -> list[dict]:
                 seen_keys.add(k)
                 row[k] = scraped.get(k)
  
+        # Superficie : depuis le millésime RP2023 l'INSEE ne publie plus la ligne
+        # « Superficie » dans le comparateur. On la reconstruit à partir de la
+        # population et de la densité, toutes deux encore présentes.
+        if not row.get("superficie_km2"):
+            pop  = _to_float(row.get("pop_2022"))
+            dens = _to_float(row.get("densite_2022"))
+            if pop is not None and dens is not None and dens > 0:
+                row["superficie_km2"] = str(round(pop / dens, 1)).replace(".", ",")
+
         # Remplacer 's' (secret statistique INSEE) par 'S'
         for k, v in row.items():
             if v == "s":
