@@ -1,26 +1,35 @@
 """
 Scraper INSEE — Comparateur de territoires
-https://www.insee.fr/fr/statistiques/zones/1405599
- 
+https://www.insee.fr/fr/statistiques/1405599
+
 Stratégie :
 1. Construire UNE SEULE URL avec tous les codes INSEE des communes
    ?geo=COM-07029+COM-07058+COM-...
-2. Playwright → clic "COMPARER LES TERRITOIRES"
+2. Récupérer la page en HTTP simple (requests)
 3. Extraire les 5 tableaux de comparaison
 4. Mapper chaque colonne à sa commune
+
+Pas de navigateur : la page /fr/statistiques/1405599 (sans le segment /zones/)
+est rendue côté serveur et contient déjà les tableaux. C'est l'URL sur laquelle
+atterrit le bouton « COMPARER LES TERRITOIRES » du comparateur interactif.
+Se passer de Playwright évite de dépendre des libs système de Chromium, absentes
+de l'image Streamlit Cloud.
 """
- 
+
 import re
 import time
- 
-try:
-    from playwright.sync_api import sync_playwright
-    _PLAYWRIGHT_OK = True
-except ImportError:
-    _PLAYWRIGHT_OK = False
- 
-_BASE_URL = "https://www.insee.fr/fr/statistiques/zones/1405599"
+
+import requests
+from bs4 import BeautifulSoup
+
+_BASE_URL = "https://www.insee.fr/fr/statistiques/1405599"
 _MAX_COMMUNES_PER_REQUEST = 20   # limite prudente pour l'URL
+_TIMEOUT = 30
+_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+    "Accept-Language": "fr-FR,fr;q=0.9",
+}
  
  
 # ── Mapping label court → clé normalisée ─────────────────────────────────────
@@ -83,8 +92,11 @@ def _norm_label(s: str) -> str:
     Le comparateur INSEE renomme ses libellés à chaque millésime
     (« Population en 2022 » → « Population en 2023 »). Neutraliser l'année
     évite de devoir repatcher LABEL_MAP tous les ans.
+
+    Les espaces sont aussi normalisés : le HTML de l'INSEE coupe ses libellés
+    sur plusieurs lignes avec de l'indentation.
     """
-    return _YEAR_RE.sub("@", s.lower().strip())
+    return _YEAR_RE.sub("@", re.sub(r"\s+", " ", s.lower()).strip())
 
 
 def _match_label(label: str) -> str | None:
@@ -98,76 +110,54 @@ def _match_label(label: str) -> str | None:
  
  
 def _clean_value(val: str) -> str:
-    """Nettoie une valeur INSEE : supprime espaces insécables, remplace – par -."""
-    return val.replace("\xa0", " ").replace(" ", " ").replace("–", "-").strip()
+    """Nettoie une valeur INSEE : normalise les espaces, remplace – par -."""
+    val = val.replace(" ", " ").replace(" ", " ").replace("–", "-")
+    return re.sub(r"\s+", " ", val).strip()
  
  
-def _search_add_commune(page, nom: str, cog: str) -> bool:
-    """Ajoute une commune au comparateur via la barre de recherche (par nom)."""
-    for inp_sel in [
-        "input[placeholder*='territoire']",
-        "input[placeholder*='commune']",
-        "input[placeholder*='Territoire']",
-        "input[aria-autocomplete='list']",
-        ".comparateur input[type='text']",
-        "input[type='text']",
-    ]:
+def _fetch_page(url: str) -> str | None:
+    """Recupere la page du comparateur, avec une seconde tentative si besoin."""
+    for attempt in (1, 2):
         try:
-            inp = page.locator(inp_sel).first
-            if not inp.is_visible(timeout=1500):
-                continue
-            inp.click()
-            inp.fill("")
-            inp.type(nom, delay=80)
-            time.sleep(1.5)
-            for res_sel in [
-                "li[class*='suggestion']", "[class*='autocomplete'] li",
-                "[role='option']", "ul[class*='dropdown'] li", ".tt-suggestion",
-            ]:
-                items = page.locator(res_sel).all()
-                for item in items:
-                    txt = item.inner_text()
-                    if "COM" in txt and (cog in txt or nom[:6].lower() in txt.lower()):
-                        item.click()
-                        time.sleep(0.5)
-                        return True
-                for item in items:
-                    if "COM" in item.inner_text():
-                        item.click()
-                        time.sleep(0.5)
-                        return True
-            break
-        except Exception:
-            pass
-    return False
- 
- 
-def _extract_tables(page, results: dict, unmatched: set | None = None) -> None:
-    """Extrait les données des tableaux comparatifs et remplit results.
+            resp = requests.get(url, headers=_HEADERS, timeout=_TIMEOUT)
+            resp.raise_for_status()
+            return resp.text
+        except requests.RequestException as e:
+            print(f"[INSEE] Tentative {attempt}/2 echouee : {type(e).__name__}: {e}")
+            if attempt == 1:
+                time.sleep(3)
+    return None
 
-    unmatched : set optionnel où sont collectés les libellés non reconnus, pour
-    détecter rapidement un renommage côté INSEE.
+
+def _extract_tables(soup, results: dict, unmatched: set | None = None) -> None:
+    """Extrait les donnees des tableaux comparatifs et remplit results.
+
+    unmatched : set optionnel ou sont collectes les libelles non reconnus, pour
+    detecter rapidement un renommage cote INSEE.
     """
-    tables = page.query_selector_all("table")
-    for table in tables:
-        rows = table.query_selector_all("tr")
+    for table in soup.find_all("table"):
+        rows = table.find_all("tr")
         if len(rows) < 2:
             continue
-        header_cells = rows[0].query_selector_all("th, td")
+
+        # Chaque colonne porte « Commune : Nom (12345) » -> on la relie a son COG
         col_to_cog: dict[int, str] = {}
-        for col_idx, cell in enumerate(header_cells):
-            cell_text = cell.inner_text().strip()
+        for col_idx, cell in enumerate(rows[0].find_all(["th", "td"])):
+            cell_text = cell.get_text(" ", strip=True)
             m = re.search(r"\((\d{5})\)", cell_text) or re.search(r"\b(\d{5})\b", cell_text)
             if m and m.group(1) in results:
                 col_to_cog[col_idx] = m.group(1)
+        if not col_to_cog:
+            continue
+
         for row in rows[1:]:
-            cells = row.query_selector_all("th, td")
+            cells = row.find_all(["th", "td"])
             if not cells:
                 continue
-            label = cells[0].inner_text().strip()
+            label = _clean_value(cells[0].get_text(" ", strip=True))
             key = _match_label(label)
             if not key:
-                # Ligne de données non reconnue → probable renommage INSEE.
+                # Ligne de donnees non reconnue -> probable renommage INSEE.
                 # On ignore les lignes de bas de tableau (sources, champ, notes).
                 if (
                     unmatched is not None
@@ -179,100 +169,40 @@ def _extract_tables(page, results: dict, unmatched: set | None = None) -> None:
                 continue
             for col_idx, cog in col_to_cog.items():
                 if col_idx < len(cells):
-                    val = _clean_value(cells[col_idx].inner_text().strip())
+                    val = _clean_value(cells[col_idx].get_text(" ", strip=True))
                     if val:
                         results[cog][key] = val
- 
- 
+
+
 def _scrape_batch(communes_batch: list[dict]) -> dict[str, dict]:
     """
-    Scrape le comparateur INSEE pour un lot de communes.
+    Recupere le comparateur INSEE pour un lot de communes.
     communes_batch : list[dict] avec 'nom' et 'code_insee'.
     Retourne dict { "57022": {indicateurs...}, ... }
     """
-    if not _PLAYWRIGHT_OK:
-        print("[INSEE] Playwright non disponible — données INSEE non collectées")
-        return {c["code_insee"]: {} for c in communes_batch if c.get("code_insee")}
- 
     cog_codes = [c["code_insee"] for c in communes_batch if c.get("code_insee")]
     if not cog_codes:
         return {}
- 
+
     geo_param = "+".join(f"COM-{cog}" for cog in cog_codes)
-    url = f"{_BASE_URL}?geo={geo_param}&debut=0"
- 
+    url = f"{_BASE_URL}?geo={geo_param}"
+
     results: dict[str, dict] = {cog: {} for cog in cog_codes}
-    cog_to_nom = {c["code_insee"]: c.get("nom", "") for c in communes_batch if c.get("code_insee")}
- 
+
     try:
-        with sync_playwright() as pw:
-            browser = pw.chromium.launch(headless=True)
-            context = browser.new_context(
-                locale="fr-FR",
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36",
-            )
-            page = context.new_page()
+        html = _fetch_page(url)
+        if html is None:
+            print("[INSEE] Page inaccessible — lot ignore")
+            return results
 
-            # Charger la page — fallback sur domcontentloaded si networkidle timeout
-            try:
-                page.goto(url, wait_until="networkidle", timeout=60000)
-            except Exception:
-                try:
-                    page.goto(url, wait_until="domcontentloaded", timeout=30000)
-                    time.sleep(5)
-                except Exception:
-                    pass
+        unmatched: set[str] = set()
+        _extract_tables(BeautifulSoup(html, "html.parser"), results, unmatched)
 
-            # Attendre et cliquer sur le bouton de comparaison
-            try:
-                page.wait_for_selector("button:has-text('comparer')", timeout=20000)
-            except Exception:
-                pass
+        if unmatched:
+            print("[INSEE] Libelles non reconnus (LABEL_MAP a mettre a jour ?) :")
+            for lbl in sorted(unmatched):
+                print(f"        - {lbl}")
 
-            clicked = False
-            for txt in ["COMPARER LES TERRITOIRES", "Comparer les territoires", "comparer"]:
-                btn = page.get_by_text(txt, exact=False)
-                if btn.count() > 0:
-                    try:
-                        btn.first.click()
-                        clicked = True
-                        break
-                    except Exception:
-                        pass
-
-            if clicked:
-                try:
-                    page.wait_for_load_state("networkidle", timeout=40000)
-                except Exception:
-                    time.sleep(6)
-                time.sleep(3)
-
-            # Première extraction via les tableaux déjà présents
-            unmatched: set[str] = set()
-            _extract_tables(page, results, unmatched)
-
-            # Pour les communes sans données → recherche par nom dans le comparateur
-            for cog in cog_codes:
-                if not results[cog]:
-                    nom = cog_to_nom.get(cog, "")
-                    if nom:
-                        print(f"[INSEE] Recherche par nom : {nom} ({cog})")
-                        added = _search_add_commune(page, nom, cog)
-                        if added:
-                            try:
-                                page.wait_for_load_state("networkidle", timeout=15000)
-                            except Exception:
-                                time.sleep(3)
-                            _extract_tables(page, results, unmatched)
-
-            if unmatched:
-                print("[INSEE] Libellés non reconnus (LABEL_MAP à mettre à jour ?) :")
-                for lbl in sorted(unmatched):
-                    print(f"        - {lbl}")
-
-            context.close()
-            browser.close()
- 
     except Exception as e:
         import traceback
         err_msg = f"[INSEE] Erreur scraping : {type(e).__name__}: {e}"
@@ -281,7 +211,7 @@ def _scrape_batch(communes_batch: list[dict]) -> dict[str, dict]:
         try:
             import streamlit as st
             st.error(err_msg)
-            with st.expander("Détails techniques INSEE"):
+            with st.expander("Details techniques INSEE"):
                 st.code(traceback.format_exc())
         except Exception:
             pass

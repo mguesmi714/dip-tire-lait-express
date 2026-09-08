@@ -9,7 +9,6 @@ import re
 import sys
 import json
 import hashlib
-import subprocess
 import concurrent.futures
 from pathlib import Path
 from datetime import date, datetime
@@ -39,23 +38,11 @@ from auth import is_authenticated, get_current_user, logout, show_login_page
 from dip_store import save_dip, list_dips, load_dip, load_dip_results
 
 
-@st.cache_resource
-def _install_playwright_chromium():
-    """Installe Chromium pour Playwright une seule fois par session cloud."""
-    import tempfile
-    flag = Path(tempfile.gettempdir()) / ".playwright_installed"
-    if not flag.exists():
-        try:
-            subprocess.run(
-                [sys.executable, "-m", "playwright", "install", "chromium"],
-                check=True, capture_output=True,
-            )
-            flag.write_text("ok")
-        except subprocess.CalledProcessError as e:
-            st.warning(f"Playwright install : {e.stderr.decode() if e.stderr else e}")
-    return True
-
-_install_playwright_chromium()
+# Plus aucun navigateur n'est nécessaire ici : tous les scrapers utilisés par
+# l'app fonctionnent en HTTP simple. Le bootstrap Chromium de Playwright a donc
+# été retiré — il téléchargeait ~150 Mo à chaque démarrage à froid pour un
+# binaire inutilisable sur Streamlit Cloud (libs système absentes de l'image).
+# Seul main.py (CLI local) utilise encore un navigateur, via scrapers/pages_jaunes.
 
 from scrapers.communes import get_communes_for_all_cp
 from scrapers.insee import get_all_communes_data, compute_zone_totals
