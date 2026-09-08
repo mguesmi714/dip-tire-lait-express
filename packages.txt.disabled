@@ -1,0 +1,26 @@
+# DESACTIVE le 08/09/2026 — renommer en packages.txt pour reactiver.
+#
+# La presence d'un packages.txt declenche une etape apt-get sur Streamlit Cloud.
+# Leur image de base reference un depot bullseye-security dont le fichier Release
+# a expire, donc apt-get update sort en code non nul et TOUT le deploiement echoue
+# (« installer returned a non-zero exit code »), avant meme les dependances Python.
+#
+# Ces paquets sont les libs systeme de Chromium pour Playwright. Le navigateur
+# lui-meme est installe au runtime par app.py (_install_playwright_chromium).
+# A reactiver des que Streamlit Cloud aura corrige son image de base.
+libnss3
+libnspr4
+libatk1.0-0
+libatk-bridge2.0-0
+libcups2
+libdrm2
+libxkbcommon0
+libxcomposite1
+libxdamage1
+libxfixes3
+libxrandr2
+libgbm1
+libpango-1.0-0
+libcairo2
+libasound2
+libatspi2.0-0
